@@ -1,0 +1,2781 @@
+PROCESSOR 16F877A
+INCLUDE "p16f877a.inc"
+
+
+__CONFIG 0x3731 ;
+; ---------------------------------------------------
+; ----------- 		Data Area 			  -----------
+; ---------------------------------------------------
+R1_LSB EQU 0x20       ; Define the memory location for R1's Least Significant Byte
+R1_MSB EQU 0x21       ; Define the memory location for R1's Most Significant Byte
+R2_LSB EQU 0x22       ; Define the memory location for R2's Least Significant Byte
+R2_MSB EQU 0x23       ; Define the memory location for R2's Most Significant Byte
+TEMP_LSB EQU 0x24     ; Define the memory location for temporary storage (Least Significant Byte)
+TEMP_MSB EQU 0x25     ; Define the memory location for temporary storage (Most Significant Byte)
+RESULT_LSB EQU 0x26   ; Define the memory location for the result (Least Significant Byte)
+RESULT_MSB EQU 0x27   ; Define the memory location for the result (Most Significant Byte)
+C1 EQU 0x29
+C2 EQU 0x2A
+C3 EQU 0x2B
+C4 EQU 0x2C
+C5 EQU 0x2D
+C6  EQU 0x56
+C7  EQU 0x57
+C8  EQU 0x58
+C9  EQU 0x59
+C10 EQU 0x5A
+C11 EQU 0x5B
+C12 EQU 0x5C
+CURSOR EQU 0x34
+FIXED_ORIGIN EQU 0x61  ; stores the starting cursor position for fill logic
+Timer1	EQU	70		
+TimerX	EQU	71	
+DIGIT6 EQU 0x50
+DIGIT5 EQU 0x51
+DIGIT4 EQU 0x52
+DIGIT3 EQU 0x53
+DIGIT2 EQU 0x54
+DIGIT1 EQU 0x55
+BCDvalH EQU 0x35
+BCDvalM EQU 0x36
+BCDvalL EQU 0x37
+MCount  EQU 0x38
+NUMHI EQU 0x3E
+NUMLO EQU 0x3F
+TIMER_INDEX EQU 0x3B
+Temp EQU 0x3C
+NEXT_STATE EQU 0x2E
+OPERATION EQU 0x2F
+E EQU 5
+RS EQU 4
+R2_C1 EQU 0x40
+R2_C2 EQU 0x41
+R2_C3 EQU 0x42
+R2_C4 EQU 0x43
+R2_C5 EQU 0x44
+R2_C6 EQU 0x45
+; Number 2 decimal part
+R2_C7  EQU 0x4B
+R2_C8  EQU 0x4C
+R2_C9  EQU 0x4D
+R2_C10 EQU 0x4E
+R2_C11 EQU 0x4F
+R2_C12 EQU 0x63
+
+INITIAL_MESSAGE_COUNTER EQU 0x60  
+RESULT_DISPLAY_MODE EQU 0x65  ; Flag to indicate we're in result display mode
+DISPLAY_STATE EQU 0x66        ; 0=result, 1=number1, 2=number2
+CARRY_SAVED EQU 0x64
+TEMP_W EQU 0x28       ; Define the memory location for unused temporary storage (not used in this code)
+DEBOUNCE_MS     EQU D'20'    ; 20 ms for switch bounce
+DCLICK_WINDOW   EQU D'10'   ; 150 ms max between presses
+DCLICK_TIMER    EQU 0x62     ; GPR for double-click countdown
+INTCON2    EQU 0xFF1   ; Interrupt Control Register 2
+INTEDG     EQU 6      ; INTEDG bit = RB0/INT edge select
+
+
+;#####################################
+DIGIT_COUNTER EQU 0x72
+DATA_COMPLETE EQU 0x73
+D1		EQU 0x74
+D2		EQU 0x75
+D3		EQU 0x76
+D4		EQU 0x77
+D5		EQU 0x78
+D6		EQU 0x79
+D7		EQU 0x7A
+D8		EQU 0x7B
+D9		EQU 0x7C
+D10		EQU 0x7D
+D11		EQU 0x7E
+D12		EQU 0x7F
+;################################
+
+
+; ---------------------------------------------------
+; ----------- 			Code Area 		  -----------
+; ---------------------------------------------------
+
+ORG 0x00              ; Set the program counter to address 0x00 (start of program)
+NOP                   ; No operation (dummy instruction)
+	GOTO INIT             ; Jump to the initialization code
+
+ORG 0x04              ; Set the program counter to address 0x04 (interrupt service routine)
+	NOP
+;############################################################################################
+        ; test Timer0 overflow (TMR0IF)
+    BTFSC   INTCON, 2       ; INTCON<2> = TMR0IF?
+    GOTO    TIMER_INTERUPT 
+
+            ; test external INT0 (pin RB0/INT)
+    BTFSC   INTCON, 1       ; INTCON<1> = INTF?
+    GOTO    BUTTON_INTERUPT
+
+            ; test Port-B change (RB4..RB7 interrupt-on-change)
+    BTFSC   INTCON, 0       ; INTCON<0> = RBIF?
+    GOTO    HANDEL_RECEIVED_DATA
+;################################################################################################
+
+
+TIMER_INTERUPT:
+    BCF     INTCON, GIE        ; disable nested interrupts
+    
+    BANKSEL RESULT_DISPLAY_MODE
+    MOVF    RESULT_DISPLAY_MODE, F
+    BTFSS   STATUS, Z
+    GOTO    _T0_END   
+
+
+    ;— 1 Double-click window countdown ——
+    BANKSEL DCLICK_TIMER
+    DECFSZ  DCLICK_TIMER, F
+        GOTO  _1S_CHECK        ; still within 150 ms window?
+    ; expired ? clear “first-tap pending” flag
+    BANKSEL NEXT_STATE
+    BCF     NEXT_STATE,0      
+
+_1S_CHECK:
+    ;— 2 One-second digit-lock countdown ——
+    BANKSEL TIMER_INDEX
+    DECFSZ  TIMER_INDEX, F
+        GOTO  _T0_END          ; still counting 1 s?  
+
+    ; 1 s has elapsed ? “lock” current digit and pre-fill the rest
+    BANKSEL CURSOR
+    MOVF    CURSOR, W
+    MOVWF   FIXED_ORIGIN
+    
+    BANKSEL NEXT_STATE
+    BTFSC   NEXT_STATE,2
+        GOTO _NO_DOT_CHECK
+    BANKSEL CURSOR
+    MOVF    CURSOR, W
+    SUBLW   0xC6
+    BTFSC   STATUS, Z
+        GOTO RETURN_TO_INTEGER
+_NO_DOT_CHECK:
+    ; ----------------------------
+    ; Load value from current digit into Temp using FSR
+    MOVF CURSOR, W
+	; — select Number-2 fill if in Number-2 mode —
+	BANKSEL NEXT_STATE
+	BTFSC   NEXT_STATE,3      ; bit 3==1 ? Number 2
+		GOTO    FILL_REMAINING_NUM2
+
+    ; Map CURSOR to FSR using switch-case logic
+    SUBLW 0xC0
+    BTFSC STATUS, Z
+    MOVLW C1
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC1
+    BTFSC STATUS, Z
+    MOVLW C2
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC2
+    BTFSC STATUS, Z
+    MOVLW C3
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC3
+    BTFSC STATUS, Z
+    MOVLW C4
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC4
+    BTFSC STATUS, Z
+    MOVLW C5
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC5
+    BTFSC STATUS, Z
+    MOVLW C6
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC7
+    BTFSC STATUS, Z
+    MOVLW C7
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC8
+    BTFSC STATUS, Z
+    MOVLW C8
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC9
+    BTFSC STATUS, Z
+    MOVLW C9
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xCA
+    BTFSC STATUS, Z
+    MOVLW C10
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xCB
+    BTFSC STATUS, Z
+    MOVLW C11
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xCC
+    BTFSC STATUS, Z
+    MOVLW C12
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    ; Load digit from selected Cx into Temp
+    MOVF INDF, W
+    MOVWF Temp
+
+	MOVF CURSOR, W
+    MOVWF FIXED_ORIGIN
+
+    ; Start filling remaining digits
+    INCF CURSOR, F
+    MOVLW D'11'
+    MOVWF MCount
+    GOTO FILL_REMAINING
+
+_RETURN_INT:
+    MOVLW   0xC0
+    MOVWF   CURSOR
+    CALL    SEND_LCD_COMMAND
+
+_T0_END:
+    BANKSEL TMR0
+    CLRF    TMR0
+    BANKSEL INTCON
+    BCF     INTCON, T0IF
+    BSF     INTCON, GIE        ; re-enable interrupts
+    BSF    INTCON, INTE
+    RETFIE
+
+RETURN_TO_INTEGER:
+    MOVLW 0xC0
+    MOVWF CURSOR
+    CALL SEND_LCD_COMMAND
+    GOTO SKIP_SECOND
+
+
+FILL_REMAINING:
+    ; Skip the dot if cursor lands on it
+    ; only in integer-entry mode do we skip over the “.” at 0xC6
+    BANKSEL NEXT_STATE
+    BTFSC   NEXT_STATE,2      ; bit2==1 means decimal mode ? don’t skip
+        GOTO   _NO_INTEGER_DOT
+    BANKSEL CURSOR
+    MOVF    CURSOR, W
+    SUBLW   0xC6
+    BTFSC   STATUS, Z
+        INCF    CURSOR, F
+
+_NO_INTEGER_DOT:
+    ; Check if done
+    MOVF CURSOR, W
+    SUBLW 0xCD
+    BTFSC STATUS, Z
+    GOTO FILL_DONE
+
+    ; Set LCD cursor
+    MOVF CURSOR, 0
+    CALL SEND_LCD_COMMAND
+
+
+    ; Display current digit in Temp (convert to ASCII)
+    MOVF Temp, W
+    ADDLW '0'         ; Convert binary digit to ASCII
+    CALL SEND_LCD_DATA
+
+
+    ; --- Store into corresponding Cx register ---
+    MOVF CURSOR, W
+    SUBLW 0xC0
+    BTFSC STATUS, Z
+    MOVLW C1
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC1
+    BTFSC STATUS, Z
+    MOVLW C2
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC2
+    BTFSC STATUS, Z
+    MOVLW C3
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC3
+    BTFSC STATUS, Z
+    MOVLW C4
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC4
+    BTFSC STATUS, Z
+    MOVLW C5
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC5
+    BTFSC STATUS, Z
+    MOVLW C6
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC7
+    BTFSC STATUS, Z
+    MOVLW C7
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC8
+    BTFSC STATUS, Z
+    MOVLW C8
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xC9
+    BTFSC STATUS, Z
+    MOVLW C9
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xCA
+    BTFSC STATUS, Z
+    MOVLW C10
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xCB
+    BTFSC STATUS, Z
+    MOVLW C11
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    MOVF CURSOR, W
+    SUBLW 0xCC
+    BTFSC STATUS, Z
+    MOVLW C12
+    BTFSC STATUS, Z
+    MOVWF FSR
+
+    ; Write value
+    MOVF Temp, W
+    MOVWF INDF
+
+    ; Move cursor forward
+    INCF CURSOR, F
+    GOTO FILL_REMAINING
+
+
+; ——— Fill remaining digits for Number 2 ———
+FILL_REMAINING_NUM2:
+    ; ——— Skip the “.” at 0xC6 ———
+    BANKSEL CURSOR
+    MOVF    CURSOR, W
+    SUBLW   0xC6
+    BTFSC   STATUS, Z
+        INCF    CURSOR, F
+
+    ; check if we’re past the last digit (0xCD)
+    MOVF    CURSOR, W
+    SUBLW   0xCD
+    BTFSC   STATUS, Z
+        GOTO    FILL_DONE
+    ; check if we’re past the last digit (0xCD)
+    MOVF    CURSOR, W
+    SUBLW   0xCD
+    BTFSC   STATUS, Z
+        GOTO    FILL_DONE
+
+    ; reposition LCD cursor
+    MOVF    CURSOR, 0
+    CALL    SEND_LCD_COMMAND
+
+    ; display Temp (binary?ASCII)
+    MOVF    Temp, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    ; store into R2_Cx based on CURSOR
+    MOVF    CURSOR, W
+    SUBLW   0xC0
+    BTFSC   STATUS, Z
+        MOVLW   R2_C1
+    BTFSC   STATUS, Z
+        MOVWF   FSR
+
+    MOVF    CURSOR, W
+    SUBLW   0xC1
+    BTFSC   STATUS, Z
+        MOVLW   R2_C2
+    BTFSC   STATUS, Z
+        MOVWF   FSR
+	    ; now write Temp back into R2_C2
+    MOVF    Temp, W
+    MOVWF   INDF
+
+
+    MOVF    CURSOR, W
+    SUBLW   0xC2
+    BTFSC   STATUS, Z
+        MOVLW   R2_C3
+    BTFSC   STATUS, Z
+        MOVWF   FSR
+	    ; now write Temp back into R2_C2
+    MOVF    Temp, W
+    MOVWF   INDF
+    MOVF    CURSOR, W
+    SUBLW   0xC3
+    BTFSC   STATUS, Z
+        MOVLW   R2_C4
+    BTFSC   STATUS, Z
+        MOVWF   FSR
+		    ; now write Temp back into R2_C2
+    MOVF    Temp, W
+    MOVWF   INDF
+    MOVF    CURSOR, W
+    SUBLW   0xC4
+    BTFSC   STATUS, Z
+        MOVLW   R2_C5
+    BTFSC   STATUS, Z
+        MOVWF   FSR
+	    ; now write Temp back into R2_C2
+    MOVF    Temp, W
+    MOVWF   INDF
+    MOVF    CURSOR, W
+    SUBLW   0xC5
+    BTFSC   STATUS, Z
+        MOVLW   R2_C6
+    BTFSC   STATUS, Z
+        MOVWF   FSR
+	    ; now write Temp back into R2_C2
+    MOVF    Temp, W
+    MOVWF   INDF
+    MOVF    CURSOR, W
+    SUBLW   0xC7
+    BTFSC   STATUS, Z
+        MOVLW   R2_C7
+    BTFSC   STATUS, Z
+        MOVWF   FSR
+	    ; now write Temp back into R2_C2
+    MOVF    Temp, W
+    MOVWF   INDF
+    MOVF    CURSOR, W
+    SUBLW   0xC8
+    BTFSC   STATUS, Z
+        MOVLW   R2_C8
+    BTFSC   STATUS, Z
+        MOVWF   FSR
+	    ; now write Temp back into R2_C2
+    MOVF    Temp, W
+    MOVWF   INDF
+    MOVF    CURSOR, W
+    SUBLW   0xC9
+    BTFSC   STATUS, Z
+        MOVLW   R2_C9
+    BTFSC   STATUS, Z
+        MOVWF   FSR
+	    ; now write Temp back into R2_C2
+    MOVF    Temp, W
+    MOVWF   INDF
+    MOVF    CURSOR, W
+    SUBLW   0xCA
+    BTFSC   STATUS, Z
+        MOVLW   R2_C10
+    BTFSC   STATUS, Z
+        MOVWF   FSR
+	    ; now write Temp back into R2_C2
+    MOVF    Temp, W
+    MOVWF   INDF
+    MOVF    CURSOR, W
+    SUBLW   0xCB
+    BTFSC   STATUS, Z
+        MOVLW   R2_C11
+    BTFSC   STATUS, Z
+        MOVWF   FSR
+	    ; now write Temp back into R2_C2
+    MOVF    Temp, W
+    MOVWF   INDF
+    MOVF    CURSOR, W
+    SUBLW   0xCC
+    BTFSC   STATUS, Z
+        MOVLW   R2_C12
+    BTFSC   STATUS, Z
+        MOVWF   FSR
+	    ; now write Temp back into R2_C2
+    MOVF    Temp, W
+    MOVWF   INDF
+    ; move to next digit
+    INCF    CURSOR, F
+
+    ; loop until done
+    GOTO    FILL_REMAINING_NUM2
+
+
+FILL_DONE:
+   ;— if we just auto-filled the last decimal (0xCC), stay there —
+   MOVF    FIXED_ORIGIN, W
+   SUBLW   0xCC
+   BTFSC   STATUS, Z
+       GOTO    _STAY_AT_LAST_DEC
+
+   ;— otherwise move one past the fixed origin —
+   MOVF    FIXED_ORIGIN, W
+   ADDLW   1
+   MOVWF   CURSOR
+   GOTO    _UPDATE_CURSOR
+
+_STAY_AT_LAST_DEC:
+   MOVLW   0xCC
+   MOVWF   CURSOR
+
+_UPDATE_CURSOR:
+    CALL SEND_LCD_COMMAND
+    GOTO   SKIP_SECOND
+
+; Fill exactly MCount more decimal digits (used by DOUBLE_CLICK)
+FILL_DECIMALS:
+FDEC_LOOP:
+    MOVF   CURSOR, W
+    SUBLW  0xC6
+    BTFSC  STATUS, Z
+        INCF  CURSOR, F
+    MOVF   CURSOR, W
+    SUBLW  0xCD    ; just past 0xCC?
+    BTFSC  STATUS, Z
+        GOTO FDEC_DONE
+    MOVF   CURSOR, 0
+    CALL   SEND_LCD_COMMAND
+    MOVF   Temp, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    INCF   CURSOR, F
+    DECFSZ MCount, F
+    GOTO   FDEC_LOOP
+FDEC_DONE:
+    RETFIE
+
+
+
+SKIP_SECOND:
+    BANKSEL TMR0
+    CLRF TMR0
+    BANKSEL INTCON
+    BCF INTCON, T0IF
+    BSF INTCON, GIE
+    BANKSEL PORTD
+    RETFIE
+
+
+INCREMENT_DISPLAY:
+	INCF CURSOR
+	MOVF CURSOR, 0
+	SUBLW 0xCB
+	BTFSC STATUS, Z
+	;GOTO DISPLAY_RESULT
+	MOVF CURSOR, 0
+	SUBLW 0xC5
+	BTFSC STATUS, Z
+	CALL SAVE_NUMBER_1
+	MOVF CURSOR, 0
+	CALL SEND_LCD_COMMAND
+	MOVLW D'30'
+	MOVWF TIMER_INDEX
+	GOTO SKIP
+
+
+SKIP:
+	BANKSEL TMR0
+	CLRF TMR0
+	BANKSEL INTCON
+	BCF INTCON, T0IF ; Clear the TMR0 ov flag
+	BSF INTCON, GIE	; ENABLE GLOBAL INTERUPTS
+	BANKSEL PORTD
+    RETFIE
+
+
+
+;––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+; BUTTON_INTERUPT: dispatch single- vs double-click, Number-1 vs Number-2
+;––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+BUTTON_INTERUPT:
+    ; First check if we're in result display mode
+    BANKSEL RESULT_DISPLAY_MODE
+    MOVF    RESULT_DISPLAY_MODE, F
+    BTFSC   STATUS, Z
+    GOTO    _NORMAL_BUTTON_HANDLING  ; Keep this for normal operation
+    
+    ; We're in result display mode - handle display cycling
+    CALL    RESET_TIMER
+    BANKSEL INTCON
+    BCF     INTCON, INTF
+    BCF     INTCON, INTE
+
+    ; Debounce
+    MOVLW   DEBOUNCE_MS
+    CALL    xms
+    BANKSEL PORTB
+    BTFSC   PORTB,0
+        GOTO  _BTN_END
+
+    ; Increment and wrap display state (0=Result, 1=Num1, 2=Num2)
+    BANKSEL DISPLAY_STATE
+    INCF    DISPLAY_STATE, F
+    MOVLW   D'3'
+    SUBWF   DISPLAY_STATE, W
+    BTFSC   STATUS, C
+    CLRF    DISPLAY_STATE
+
+    ; Clear display before showing new content
+    MOVLW   0x01
+    CALL    SEND_LCD_COMMAND
+
+    ; Jump to appropriate display based on state
+    MOVF    DISPLAY_STATE, W
+    BTFSC   STATUS, Z
+    GOTO    _SHOW_RESULT
+    DECFSZ  DISPLAY_STATE, W
+    GOTO    _SHOW_NUM2
+    
+    ; State 1: Show Num1
+_SHOW_NUM1:
+    CALL    SHOW_NUM1
+    GOTO    _BTN_END
+
+    ; State 2: Show Num2
+_SHOW_NUM2:
+    CALL    SHOW_NUM2
+    GOTO    _BTN_END
+
+    ; State 0: Show Result
+_SHOW_RESULT:
+    CALL    SHOW_RESULT
+
+_NORMAL_BUTTON_HANDLING:
+    ; Original button handling code here
+    CALL    RESET_TIMER
+    BANKSEL INTCON
+    BCF     INTCON, INTF
+    BCF     INTCON, INTE
+
+    ;—— debounce ——
+    MOVLW   DEBOUNCE_MS
+    CALL    xms
+    BANKSEL PORTB
+    BTFSC   PORTB,0
+        GOTO  _BTN_END
+
+    BANKSEL NEXT_STATE
+    BTFSC   NEXT_STATE,0
+        GOTO  _2ND_TAP
+
+    ;—— first tap ——
+    BSF     NEXT_STATE,0
+    MOVLW   DCLICK_WINDOW
+    MOVWF   DCLICK_TIMER
+
+    BANKSEL NEXT_STATE
+    BTFSS   NEXT_STATE,3
+        GOTO    NUMBERS_IN
+    GOTO    NUMBERS_IN_FOR_NUM2
+
+_2ND_TAP:
+    BCF     NEXT_STATE,0
+    GOTO    HANDLE_DOUBLE_CLICK
+
+_BTN_END:
+    BSF     INTCON, INTE
+    BSF     INTCON, GIE
+    RETFIE
+
+;––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+; HANDLE_DOUBLE_CLICK: finish Number-1 or send Number-2
+;––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+HANDLE_DOUBLE_CLICK:
+    BANKSEL NEXT_STATE
+
+    ;—— if in Number-2 and decimal edit ? send —— 
+    BTFSS   NEXT_STATE,3         ; not Number-2?
+        GOTO    _skip_send_aux
+    BTFSS   NEXT_STATE,2         ; not in decimal?
+        GOTO    _skip_send_aux
+
+    ; — we’re in N2 + decimal — PRINT “=” & send
+   
+    BANKSEL INTCON
+    BCF     INTCON, T0IE       ; turn off Timer0 interrupts
+    BCF     INTCON, INTE       ; turn off RB0  digit entry  interrupt
+   
+    CALL    PRINT_EQUAL
+    CALL    sendDataToAuxiliary
+
+    GOTO    _BTN_END
+
+
+
+_skip_send_aux:
+    ;— if already in decimal-entry, finish the first number and switch to #2 —
+    BANKSEL NEXT_STATE
+    BTFSC   NEXT_STATE,2
+        GOTO    DC_FINISH_DEC
+
+    ;— enter decimal mode for whichever number we’re on —
+    BSF     NEXT_STATE,2        ; set decimal flag
+    MOVLW   0xC7                ; DDRAM addr of first decimal cell
+    MOVWF   CURSOR
+    CALL    SEND_LCD_COMMAND
+
+    ;— now load “last integer digit” into Temp, based on Number-1 vs 2 —
+    BANKSEL NEXT_STATE
+    BTFSC   NEXT_STATE,3        ; if bit3==1 ? Number 2
+        GOTO    _LOAD_NUM2_TEMP
+
+    ; Number 1: read DDRAM[0xC7] via FSR?INDF
+    MOVLW   C7
+    MOVWF   FSR
+    MOVF    INDF, W
+    MOVWF   Temp
+    GOTO    _LOAD_DEC_DONE
+
+_LOAD_NUM2_TEMP:
+    ; Number 2: read from your saved R2_C7
+    MOVF    R2_C7, W
+    MOVWF   Temp
+
+_LOAD_DEC_DONE:
+    ;— now pre-fill the remaining 5 decimal digits —
+    MOVLW   D'5'
+    MOVWF   MCount
+    GOTO    FILL_DEC_LOOP
+
+
+DC_FINISH_DEC:
+    ; finish Number-1 ? switch to Number-2
+    BSF     NEXT_STATE,1         ; mark “1st done”
+    BSF     NEXT_STATE,3         ; now Number-2
+    BCF     NEXT_STATE,2         ; clear decimal flag
+    CALL    DISPLAY_NUMBER_2
+    MOVLW   0xC0
+    MOVWF   CURSOR
+    CALL    SEND_LCD_COMMAND
+    GOTO    _BTN_END
+
+
+
+FILL_DEC_LOOP:
+    ; if we’ve gone past the last decimal position (0xCC)…
+    MOVF    CURSOR, W
+    SUBLW   0xCD            ; W = CURSOR - 0xCD
+    BTFSC   STATUS, C       ; CURSOR >= 0xCD ?
+        GOTO    _WRAP_DEC
+
+_SKIP_WRAP:
+    ; position LCD at CURSOR
+    MOVF    CURSOR, W
+    CALL    SEND_LCD_COMMAND
+
+    ; display the saved digit in Temp (convert to ASCII)
+    MOVF    Temp, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+    
+    MOVF    CURSOR, W
+    SUBLW   0xC7
+    BTFSC   STATUS, Z
+    MOVLW   C7
+    BTFSC   STATUS, Z
+    MOVWF   FSR
+    
+    MOVF    CURSOR, W
+    SUBLW   0xC8
+    BTFSC   STATUS, Z
+    MOVLW   C8
+    BTFSC   STATUS, Z
+    MOVWF   FSR
+    
+    MOVF    CURSOR, W
+    SUBLW   0xC9
+    BTFSC   STATUS, Z
+    MOVLW   C9
+    BTFSC   STATUS, Z
+    MOVWF   FSR
+    
+    MOVF    CURSOR, W
+    SUBLW   0xCA
+    BTFSC   STATUS, Z
+    MOVLW   C10
+    BTFSC   STATUS, Z
+    MOVWF   FSR
+    
+    MOVF    CURSOR, W
+    SUBLW   0xCB
+    BTFSC   STATUS, Z
+    MOVLW   C11
+    BTFSC   STATUS, Z
+    MOVWF   FSR
+    
+    MOVF    CURSOR, W
+    SUBLW   0xCC
+    BTFSC   STATUS, Z
+    MOVLW   C12
+    BTFSC   STATUS, Z
+    MOVWF   FSR
+    
+    MOVF    Temp, W            ; Store '0' in the register
+    MOVWF   INDF
+    
+    INCF    CURSOR, F          ; Move to next digit
+    DECFSZ  MCount, F          ; Decrement counter
+    GOTO    FILL_DEC_LOOP
+    GOTO    _DONE_DEC_FILL
+    
+_WRAP_DEC:
+    ; wrap straight back to the MSB-decimal cell
+    MOVLW   0xC7
+    MOVWF   CURSOR
+    GOTO    _SKIP_WRAP
+    
+
+_DONE_DEC_FILL:
+    ; now that we’ve finished MCount digits, leave CURSOR at MSB
+    MOVLW   0xC7
+    MOVWF   CURSOR
+    CALL    SEND_LCD_COMMAND
+    MOVLW   D'30' ; Reset timer for digit entry
+    MOVWF   TIMER_INDEX
+    GOTO    _BTN_END           ; Return from interrupt
+
+;––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+; FILL_DEC_LOOP_N2 = same but writing into R2_C7..R2_C12
+;––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+FILL_DEC_LOOP_N2:
+    MOVF    CURSOR, W
+    SUBLW   0xCD
+    BTFSC   STATUS, C
+        GOTO    _WRAP_DEC2
+_SKIP_WRAP2:
+    MOVF    CURSOR, W
+    CALL    SEND_LCD_COMMAND
+    
+    MOVF    Temp, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+    
+    MOVF    CURSOR, W
+    SUBLW   0xC7
+    BTFSC   STATUS, Z
+    MOVLW   R2_C7
+    BTFSC   STATUS, Z
+    MOVWF   FSR
+    
+    MOVF    CURSOR, W
+    SUBLW   0xC8
+    BTFSC   STATUS, Z
+    MOVLW   R2_C8
+    BTFSC   STATUS, Z
+    MOVWF   FSR
+    
+    MOVF    CURSOR, W
+    SUBLW   0xC9
+    BTFSC   STATUS, Z
+    MOVLW   R2_C9
+    BTFSC   STATUS, Z
+    MOVWF   FSR
+    
+    MOVF    CURSOR, W
+    SUBLW   0xCA
+    BTFSC   STATUS, Z
+    MOVLW   R2_C10
+    BTFSC   STATUS, Z
+    MOVWF   FSR
+    
+    MOVF    CURSOR, W
+    SUBLW   0xCB
+    BTFSC   STATUS, Z
+    MOVLW   R2_C11
+    BTFSC   STATUS, Z
+    MOVWF   FSR
+    
+    MOVF    CURSOR, W
+    SUBLW   0xCC
+    BTFSC   STATUS, Z
+    MOVLW   R2_C12
+    BTFSC   STATUS, Z
+    MOVWF   FSR
+    
+    MOVF    Temp, W            ; Store '0' in the register
+    MOVWF   INDF
+    INCF    CURSOR, F
+    DECFSZ  MCount, F
+    GOTO    FILL_DEC_LOOP_N2
+    GOTO    _DONE_DEC2
+
+_WRAP_DEC2:
+    MOVLW   0xC7
+    MOVWF   CURSOR
+    GOTO    FILL_DEC_LOOP_N2
+
+_DONE_DEC2:
+    MOVLW   0xC7
+    MOVWF   CURSOR
+    CALL    SEND_LCD_COMMAND
+    MOVLW   D'30'
+    MOVWF   TIMER_INDEX
+    GOTO    _BTN_END
+
+
+
+DISPLAY_NUMBER_2:
+    ; Clear LCD
+    MOVLW 0x01
+    CALL SEND_LCD_COMMAND
+    ; ——— Reset all Number 2 counters to 0 ———
+    BANKSEL   R2_C1
+    CLRF      R2_C1
+    CLRF      R2_C2
+    CLRF      R2_C3
+    CLRF      R2_C4
+    CLRF      R2_C5
+    CLRF      R2_C6
+    CLRF      R2_C7
+    CLRF      R2_C8
+    CLRF      R2_C9
+    CLRF      R2_C10
+    CLRF      R2_C11
+    CLRF      R2_C12
+
+    ; Show "Number 2" on line 1
+    MOVLW 0x80
+    CALL SEND_LCD_COMMAND
+    MOVLW 'N'
+    CALL SEND_LCD_DATA
+    MOVLW 'u'
+    CALL SEND_LCD_DATA
+    MOVLW 'm'
+    CALL SEND_LCD_DATA
+    MOVLW 'b'
+    CALL SEND_LCD_DATA
+    MOVLW 'e'
+    CALL SEND_LCD_DATA
+    MOVLW 'r'
+    CALL SEND_LCD_DATA
+    MOVLW ' '
+    CALL SEND_LCD_DATA
+    MOVLW '2'
+    CALL SEND_LCD_DATA
+
+    ; Wait 1 second
+    MOVLW D'250'
+    CALL xms
+
+    ; Display 000000.000000
+    MOVLW 0xC0
+    CALL SEND_LCD_COMMAND
+    MOVLW D'6'
+    MOVWF MCount
+
+PrintSecondInt:
+    MOVLW '0'
+    CALL SEND_LCD_DATA
+    DECFSZ MCount, F
+    GOTO PrintSecondInt
+
+    MOVLW '.'
+    CALL SEND_LCD_DATA
+
+    MOVLW D'6'
+    MOVWF MCount
+
+PrintSecondDec:
+    MOVLW '0'
+    CALL SEND_LCD_DATA
+    DECFSZ MCount, F
+    GOTO PrintSecondDec
+
+    ; Set cursor and enable blinking
+    MOVLW 0xC0
+    MOVWF CURSOR
+    CALL SEND_LCD_COMMAND
+
+     BANKSEL NEXT_STATE
+    BSF     NEXT_STATE,3    ; ? now correctly marks “I’m on Number 2”
+
+
+    ; re-enable the button interrupt and return
+    BSF     INTCON, INTE
+    BSF     INTCON, GIE
+    RETURN
+
+
+
+SAVE_NUMBER_1:
+
+SAVE_NUMBER_2:
+
+
+	
+	
+NUMBERS_IN:
+    BANKSEL NEXT_STATE
+    BTFSS  NEXT_STATE,2
+        GOTO  NUM_INT
+    GOTO  NUM_DEC
+
+NUM_INT:
+    MOVF    CURSOR, W
+    SUBLW   0xC0    ; pos 1
+    BTFSC   STATUS, Z
+    GOTO    INC_C1
+    MOVF    CURSOR, W
+    SUBLW   0xC1    ; pos 2
+    BTFSC   STATUS, Z
+    GOTO    INC_C2
+    MOVF    CURSOR, W
+    SUBLW   0xC2    ; pos 3
+    BTFSC   STATUS, Z
+    GOTO    INC_C3
+    MOVF    CURSOR, W
+    SUBLW   0xC3    ; pos 4
+    BTFSC   STATUS, Z
+    GOTO    INC_C4
+    MOVF    CURSOR, W
+    SUBLW   0xC4    ; pos 5
+    BTFSC   STATUS, Z
+    GOTO    INC_C5
+    MOVF    CURSOR, W
+    SUBLW   0xC5    ; pos 6 (skip the “.” at 0xC6)
+    BTFSC   STATUS, Z
+    GOTO    INC_C6
+	RETFIE
+
+NUM_DEC:
+    MOVF    CURSOR, W
+    SUBLW   0xC7    ; pos 7
+    BTFSC   STATUS, Z
+    GOTO    INC_C7
+    MOVF    CURSOR, W
+    SUBLW   0xC8    ; pos 8
+    BTFSC   STATUS, Z
+    GOTO    INC_C8
+    MOVF    CURSOR, W
+    SUBLW   0xC9    ; pos 9
+    BTFSC   STATUS, Z
+    GOTO    INC_C9
+    MOVF    CURSOR, W
+    SUBLW   0xCA    ; pos 10
+    BTFSC   STATUS, Z
+    GOTO    INC_C10
+    MOVF    CURSOR, W
+    SUBLW   0xCB    ; pos 11
+    BTFSC   STATUS, Z
+    GOTO    INC_C11
+    MOVF    CURSOR, W
+    SUBLW   0xCC    ; pos 12
+    BTFSC   STATUS, Z
+    GOTO    INC_C12
+	RETFIE
+
+WRAP_TO_INT1:
+    MOVLW  0xC0
+    MOVWF  CURSOR          ; move cursor back to first integer cell
+    CALL   SEND_LCD_COMMAND
+    GOTO   INTERUPT_END
+
+;=== Generic Increment Routines (0-9 for ALL digits) ===;
+
+INC_C1:                 ; Tens of hours (0-9)
+    INCF   C1, F
+    MOVF   C1, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+    CLRF   C1
+    MOVF   C1, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    GOTO   INTERUPT_END
+
+INC_C3:                 
+    INCF   C3, F
+    MOVF   C3, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+    CLRF   C3
+    MOVF   C3, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    GOTO   INTERUPT_END
+
+INC_C2:               
+    INCF   C2, F
+    MOVF   C2, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+    CLRF   C2
+    MOVF   C2, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    GOTO   INTERUPT_END
+
+INC_C5:                
+    INCF   C5, F
+    MOVF   C5, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+    CLRF   C5
+    MOVF   C5, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    GOTO   INTERUPT_END
+
+
+INC_C4:                 
+    INCF   C4, F
+    MOVF   C4, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+    CLRF   C4
+    MOVF   C4, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    GOTO   INTERUPT_END
+
+INC_C6:                
+    INCF   C6, F
+    MOVF   C6, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+    CLRF   C6
+    MOVF   C6, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    GOTO   INTERUPT_END
+
+;--- 1st decimal digit (pos 7) ---
+INC_C7:
+    MOVF   C7, W    ; Load current value into W
+    MOVWF  Temp     ; Store in Temp for fill operation
+    INCF   C7, F    ; Increment C7
+    MOVF   C7, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   C7
+    MOVF   C7, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVLW  D'30'
+    MOVWF  TIMER_INDEX
+    GOTO   INTERUPT_END
+
+;--- 2nd decimal digit (pos 8) ---
+INC_C8:
+    INCF   C8, F
+    MOVF   C8, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   C8
+    MOVF   C8, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVLW  D'30'
+    MOVWF  TIMER_INDEX
+    GOTO   INTERUPT_END
+
+;--- 3rd decimal digit (pos 9) ---
+INC_C9:
+    INCF   C9, F
+    MOVF   C9, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   C9
+    MOVF   C9, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVLW  D'30'
+    MOVWF  TIMER_INDEX
+    GOTO   INTERUPT_END
+
+;--- 4th decimal digit (pos 10) ---
+INC_C10:
+    INCF   C10, F
+    MOVF   C10, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   C10
+    MOVF   C10, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVLW  D'30'
+    MOVWF  TIMER_INDEX
+    GOTO   INTERUPT_END
+
+;--- 5th decimal digit (pos 11) ---
+INC_C11:
+    INCF   C11, F
+    MOVF   C11, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   C11
+    MOVF   C11, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVLW  D'30'
+    MOVWF  TIMER_INDEX
+    GOTO   INTERUPT_END
+
+;--- 6th decimal digit (pos 12) ---
+INC_C12:
+    INCF   C12, F
+    MOVF   C12, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   C12
+    MOVF   C12, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+        ; now wrap cursor from 0xCC ? 0xC7
+    MOVLW   0xC7
+    MOVWF   CURSOR
+    CALL    SEND_LCD_COMMAND
+
+    MOVLW  D'30'
+    MOVWF  TIMER_INDEX
+    GOTO   INTERUPT_END
+
+
+
+;;;; Number 2 
+;;; Number 2 increment routines
+;;;; Number 2 
+;;; Number 2 increment routines (now preserving the filled value)
+
+INC_R2C1:
+    MOVF   R2_C1, W    ; ? reload the current digit into Temp
+    MOVWF  Temp
+    INCF   R2_C1, F
+    MOVF   R2_C1, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   R2_C1
+    MOVF   R2_C1, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVF   R2_C1, W
+    MOVWF  Temp        ; update Temp for next tap
+    GOTO   INTERUPT_END
+
+INC_R2C2:
+    MOVF   R2_C2, W
+    MOVWF  Temp
+    INCF   R2_C2, F
+    MOVF   R2_C2, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   R2_C2
+    MOVF   R2_C2, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVF   R2_C2, W
+    MOVWF  Temp
+    GOTO   INTERUPT_END
+
+INC_R2C3:
+    MOVF   R2_C3, W
+    MOVWF  Temp
+    INCF   R2_C3, F
+    MOVF   R2_C3, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   R2_C3
+    MOVF   R2_C3, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVF   R2_C3, W
+    MOVWF  Temp
+    GOTO   INTERUPT_END
+
+INC_R2C4:
+    MOVF   R2_C4, W
+    MOVWF  Temp
+    INCF   R2_C4, F
+    MOVF   R2_C4, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   R2_C4
+    MOVF   R2_C4, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVF   R2_C4, W
+    MOVWF  Temp
+    GOTO   INTERUPT_END
+
+INC_R2C5:
+    MOVF   R2_C5, W
+    MOVWF  Temp
+    INCF   R2_C5, F
+    MOVF   R2_C5, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   R2_C5
+    MOVF   R2_C5, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVF   R2_C5, W
+    MOVWF  Temp
+    GOTO   INTERUPT_END
+
+INC_R2C6:
+    MOVF   R2_C6, W
+    MOVWF  Temp
+    INCF   R2_C6, F
+    MOVF   R2_C6, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   R2_C6
+    MOVF   R2_C6, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVF   R2_C6, W
+    MOVWF  Temp
+    GOTO   INTERUPT_END
+
+INC_R2C7:
+    MOVF   R2_C7, W
+    MOVWF  Temp
+    INCF   R2_C7, F
+    MOVF   R2_C7, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   R2_C7
+    MOVF   R2_C7, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVF   R2_C7, W
+    MOVWF  Temp
+    MOVLW  D'30'
+    MOVWF  TIMER_INDEX
+    GOTO   INTERUPT_END
+
+INC_R2C8:
+    MOVF   R2_C8, W
+    MOVWF  Temp
+    INCF   R2_C8, F
+    MOVF   R2_C8, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   R2_C8
+    MOVF   R2_C8, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVF   R2_C8, W
+    MOVWF  Temp
+    MOVLW  D'30'
+    MOVWF  TIMER_INDEX
+    GOTO   INTERUPT_END
+
+INC_R2C9:
+    MOVF   R2_C9, W
+    MOVWF  Temp
+    INCF   R2_C9, F
+    MOVF   R2_C9, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   R2_C9
+    MOVF   R2_C9, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVF   R2_C9, W
+    MOVWF  Temp
+    MOVLW  D'30'
+    MOVWF  TIMER_INDEX
+    GOTO   INTERUPT_END
+
+INC_R2C10:
+    MOVF   R2_C10, W
+    MOVWF  Temp
+    INCF   R2_C10, F
+    MOVF   R2_C10, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   R2_C10
+    MOVF   R2_C10, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVF   R2_C10, W
+    MOVWF  Temp
+    MOVLW  D'30'
+    MOVWF  TIMER_INDEX
+    GOTO   INTERUPT_END
+
+INC_R2C11:
+    MOVF   R2_C11, W
+    MOVWF  Temp
+    INCF   R2_C11, F
+    MOVF   R2_C11, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   R2_C11
+    MOVF   R2_C11, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVF   R2_C11, W
+    MOVWF  Temp
+    MOVLW  D'30'
+    MOVWF  TIMER_INDEX
+    GOTO   INTERUPT_END
+
+INC_R2C12:
+    MOVF   R2_C12, W
+    MOVWF  Temp
+    INCF   R2_C12, F
+    MOVF   R2_C12, W
+    SUBLW  D'9'
+    BTFSS  STATUS, C
+        CLRF   R2_C12
+    MOVF   R2_C12, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+    MOVF   CURSOR, W
+    CALL   SEND_LCD_COMMAND
+    MOVF   R2_C12, W
+    MOVWF  Temp
+    MOVLW  D'30'
+    MOVWF  TIMER_INDEX
+    GOTO   INTERUPT_END
+
+  
+NUMBERS_IN_FOR_NUM2: 
+    MOVF CURSOR, W 
+    SUBLW 0xC6 
+    BTFSC STATUS, Z 
+    GOTO WRAP_TO_R2C1 
+   
+    MOVF CURSOR, W 
+    SUBLW 0xC0 
+    BTFSC STATUS, Z 
+    GOTO INC_R2C1 
+    MOVF CURSOR, W 
+    SUBLW 0xC1 
+    BTFSC STATUS, Z 
+    GOTO INC_R2C2 
+    MOVF CURSOR, W 
+    SUBLW 0xC2 
+    BTFSC STATUS, Z 
+    GOTO INC_R2C3 
+    MOVF CURSOR, W 
+    SUBLW 0xC3 
+    BTFSC STATUS, Z 
+    GOTO INC_R2C4 
+    MOVF CURSOR, W 
+    SUBLW 0xC4 
+    BTFSC STATUS, Z 
+    GOTO INC_R2C5 
+   
+    ; Decimal digits are stored in C6-C12 for both numbers 
+    MOVF CURSOR, W 
+    SUBLW 0xC5 
+    BTFSC STATUS, Z 
+    GOTO INC_R2C6 
+    MOVF CURSOR, W 
+    SUBLW 0xC7 
+    BTFSC STATUS, Z 
+    GOTO INC_R2C7 
+    MOVF CURSOR, W 
+    SUBLW 0xC8 
+    BTFSC STATUS, Z 
+    GOTO INC_R2C8 
+    MOVF CURSOR, W 
+    SUBLW 0xC9 
+    BTFSC STATUS, Z 
+    GOTO INC_R2C9 
+    MOVF CURSOR, W 
+    SUBLW 0xCA 
+    BTFSC STATUS, Z 
+    GOTO INC_R2C10 
+    MOVF CURSOR, W 
+    SUBLW 0xCB 
+    BTFSC STATUS, Z 
+    GOTO INC_R2C11 
+    MOVF CURSOR, W 
+    SUBLW 0xCC 
+    BTFSC STATUS, Z 
+    GOTO INC_R2C12 
+    GOTO INTERUPT_END 
+
+WRAP_TO_R2C1: 
+    MOVLW 0xC0 
+    MOVWF CURSOR 
+    CALL SEND_LCD_COMMAND 
+    GOTO INTERUPT_END
+
+
+INTERUPT_END:
+	BANKSEL INTCON
+	BCF INTCON, INTF
+   	BCF 	PIR1,TMR1IF     ; clear the TMR1 ov flag 
+	BSF INTCON, INTE	
+	BANKSEL PORTD
+	RETFIE
+
+RESET_COUNTER_C1:
+	MOVLW '0'
+	MOVWF C1
+	RETURN
+RESET_COUNTER_C2:
+	MOVLW '0'
+	MOVWF C2
+	RETURN
+RESET_COUNTER_C3:
+	MOVLW '0'
+	MOVWF C3
+	RETURN
+RESET_COUNTER_C4:
+	MOVLW '0'
+	MOVWF C4
+	RETURN
+RESET_COUNTER_C5:
+	MOVLW '0'
+	MOVWF C5
+	RETURN
+
+RESET_COUNTER_C6:
+    MOVLW '0'
+    MOVWF C6
+    RETURN
+
+RESET_COUNTER_C7:
+    MOVLW '0'
+    MOVWF C7
+    RETURN
+
+RESET_COUNTER_C8:
+    MOVLW '0'
+    MOVWF C8
+    RETURN
+
+RESET_COUNTER_C9:
+    MOVLW '0'
+    MOVWF C9
+    RETURN
+
+RESET_COUNTER_C10:
+    MOVLW '0'
+    MOVWF C10
+    RETURN
+
+RESET_COUNTER_C11:
+    MOVLW '0'
+    MOVWF C11
+    RETURN
+
+RESET_COUNTER_C12:
+    MOVLW '0'
+    MOVWF C12
+    RETURN
+
+; ==========================================================================
+;						END INTERUPTS
+;											  
+; ===========================================================================
+INIT:
+    CLRF    R2_C1
+    CLRF    R2_C2
+    CLRF    R2_C3
+    CLRF    R2_C4
+    CLRF    R2_C5
+    CLRF    R2_C6
+    CLRF    R2_C7
+    CLRF    R2_C8
+    CLRF    R2_C9
+    CLRF    R2_C10
+    CLRF    R2_C11
+    CLRF    R2_C12
+    CLRF    RESULT_LSB
+    CLRF    RESULT_MSB
+    CLRF    R1_LSB
+    CLRF    R2_LSB
+    CLRF    R1_MSB
+    CLRF    R2_MSB
+    CLRF    TEMP_LSB
+    CLRF    TEMP_MSB
+    CLRF    NEXT_STATE
+    BCF   INTCON2, INTEDG
+
+    BSF   INTCON, INTE
+    BSF   INTCON, GIE
+    BSF   INTCON, T0IE
+   
+    ; initialize all C1…C12 to 0 (not ASCII)
+    CLRF   C1
+    CLRF   C2
+    CLRF   C3
+    CLRF   C4
+    CLRF   C5
+    CLRF   C6
+    CLRF   C7
+    CLRF   C8
+    CLRF   C9
+    CLRF   C10
+    CLRF   C11
+    CLRF   C12
+
+    ; initialize all C1…C12 to ASCII '0'
+    MOVLW   0
+    MOVWF   C1
+    MOVWF   C2
+    MOVWF   C3
+    MOVWF   C4
+    MOVWF   C5
+    MOVWF   C6
+    MOVWF   C7
+    MOVWF   C8
+    MOVWF   C9
+    MOVWF   C10
+    MOVWF   C11
+    MOVWF   C12
+
+    MOVLW   0
+    MOVWF   R2_C1
+    MOVWF   R2_C2
+    MOVWF   R2_C3
+    MOVWF   R2_C4
+    MOVWF   R2_C5
+    MOVWF   R2_C6
+    MOVWF   R2_C7
+    MOVWF   R2_C8
+    MOVWF   R2_C9
+    MOVWF   R2_C10
+    MOVWF   R2_C11
+    MOVWF   R2_C12
+
+
+    
+    MOVLW   0xC0
+    MOVWF   CURSOR
+    MOVLW   D'30'
+    MOVWF   TIMER_INDEX
+    CALL    PORTS_INIT
+    CALL    INIT_DISPLAY
+    CALL    INTERUPT_INIT
+	call RECEIVE_DATA_FROM_AUXILIARY_SETUP
+    ;CALL    INTITIAL_MESSAGE
+	goto loop
+START:
+    GOTO    loop
+
+
+; ==========================================================================
+;						INTERUPTS & PORTS
+;											  
+; ===========================================================================
+INTERUPT_INIT: 
+	BANKSEL INTCON
+	BSF INTCON, GIE			; ENABLE GLOBAL INTERUPTS
+	BSF INTCON, INTE		; ENABLE RB0 INTERUPT BIT
+	BSF INTCON, T0IE        ; Enable Timer0 Interrupts
+	BANKSEL OPTION_REG
+	MOVLW 07h
+	MOVWF OPTION_REG ;Prescaler set to maximum
+	BCF INTCON, T0IF ; Clear the TMR0 ov flag
+	BANKSEL PORTD
+	RETURN
+PORTS_INIT:
+	; Convert PORTD into a digital 
+	BANKSEL TRISD
+	CLRF TRISD	; SET ALL PINS AS OUTPUT
+	BANKSEL PORTD
+	CLRF PORTD
+	BANKSEL ADCON1
+	MOVLW 0x06
+	MOVWF ADCON1
+	; SET PORTB PIN0 AS AN INPUT
+	BANKSEL TRISB
+	CLRF TRISB
+	CLRF PORTB
+	BSF TRISB, 0
+	BANKSEL PORTD
+	RETURN
+RESET_TIMER:
+	BANKSEL PORTD
+	MOVLW D'30'
+	MOVWF TIMER_INDEX
+	BSF INTCON, T0IF ; Clear the TMR0 ov flag
+	RETURN
+; ==========================================================================
+;						DISPLAY AND DELAYS
+;											  
+; ===========================================================================
+xms:
+	MOVWF	TimerX			; Count for X ms
+loopX:	
+	CALL	onems			; Delay 1ms
+	DECFSZ	TimerX			; Repeat X times 
+	GOTO	loopX			; until Z
+	RETURN					; and finish
+onems:	
+	MOVLW	D'249'			; Count for 1ms delay 
+	MOVWF	Timer1			; Load count
+loop1:
+	NOP						; Pad for 4 cycle loop
+	DECFSZ	Timer1			; Count
+	GOTO	loop1			; until Z
+	RETURN				; and finish
+INIT_DISPLAY:
+	MOVLW D'100'
+	CALL xms
+	MOVLW 0x03
+	MOVWF PORTD ; SEND 0x03 
+	CALL ENABLE_PULSE
+	call onems
+	call onems
+	call onems
+	call onems
+	call onems
+	CALL ENABLE_PULSE
+	call onems
+	CALL ENABLE_PULSE
+	BCF PORTD, 0
+	CALL ENABLE_PULSE
+	MOVLW	0x2		; Set 4-bit mode, 2 lines 0x28
+	MOVWF PORTD
+	call ENABLE_PULSE
+	call onems
+	MOVLW 0x8
+	CLRF PORTD
+	MOVWF PORTD
+	call ENABLE_PULSE
+	call onems
+	CLRF PORTD
+	call ENABLE_PULSE
+	call onems
+	MOVLW 0x0C
+	MOVWF PORTD
+	call ENABLE_PULSE
+	call onems
+	RETURN		
+
+ENABLE_PULSE:
+	BSF PORTD, E
+	call onems
+	call onems
+	call onems
+	call onems
+	call onems
+	BCF PORTD, E
+	call onems
+	call onems
+	call onems
+	call onems
+	call onems
+	RETURN
+
+SEND_LCD_DATA:
+	MOVWF TEMP_W		; SAVE A COPY OF W
+	SWAPF  TEMP_W		; SWAP THE HIGHER NIBBLE WITH THE LOWER
+	MOVF TEMP_W, 0		; RELOAD THE SWAPPED NIBBLES TO W
+	ANDLW 0x0F			; GET RID OF THE "HIGHER NIBBLE" (LOWER ORIGINALY)
+	MOVWF PORTD			; STORE THE "LOWER NIBBLE" (HIGHER ORIGINALY) IN PORTD
+	BSF PORTD, RS		; SELECT DATA REGISTER
+	call ENABLE_PULSE	; SEND PULSE
+	call onems
+	SWAPF TEMP_W		; RESWAP THE NIBBLES
+	MOVF TEMP_W, 0		; STORE IT BACK IN W
+	ANDLW 0x0F			; GET RID OF THE "HIGHER NIBBLE"
+	MOVWF PORTD			; STORE THE LOWER NIBBLE IN W
+	BSF PORTD, RS		; SELECT DATA REGISTER
+	call ENABLE_PULSE 	; SEND PULSE
+	call onems
+	RETURN
+
+SEND_LCD_COMMAND:
+	MOVWF TEMP_W		; SAVE A COPY OF W
+	SWAPF  TEMP_W		; SWAP THE HIGHER NIBBLE WITH THE LOWER
+	MOVF TEMP_W, 0		; RELOAD THE SWAPPED NIBBLES TO W
+	ANDLW 0x0F			; GET RID OF THE "HIGHER NIBBLE" (LOWER ORIGINALY)
+	MOVWF PORTD			; STORE THE "LOWER NIBBLE" (HIGHER ORIGINALY) IN PORTD
+	BCF PORTD, RS		; SELECT COMMAND REGISTER
+	call ENABLE_PULSE	; SEND PULSE
+	call onems
+	SWAPF TEMP_W		; RESWAP THE NIBBLES
+	MOVF TEMP_W, 0		; STORE IT BACK IN W
+	ANDLW 0x0F			; GET RID OF THE "HIGHER NIBBLE"
+	MOVWF PORTD			; STORE THE LOWER NIBBLE IN W
+	BCF PORTD, RS		; SELECT COMMAND REGISTER
+	call ENABLE_PULSE 	; SEND PULSE
+	call onems
+	RETURN
+
+
+INTITIAL_MESSAGE:
+    BANKSEL INTCON
+    BCF INTCON, GIE    ; Disable global interrupts
+
+    ; ——— blink “Welcome to Division” 3× ———
+    CALL    WELCOME_BLINK_LOOP   
+
+    ; Clear display
+    MOVLW 0x01
+    CALL SEND_LCD_COMMAND
+    CALL xms
+
+    ; Line 1: Display "Number 1"
+    MOVLW 0x80         ; First line, first column
+    CALL SEND_LCD_COMMAND
+    MOVLW 'N'
+    CALL SEND_LCD_DATA
+    MOVLW 'u'
+    CALL SEND_LCD_DATA
+    MOVLW 'm'
+    CALL SEND_LCD_DATA
+    MOVLW 'b'
+    CALL SEND_LCD_DATA
+    MOVLW 'e'
+    CALL SEND_LCD_DATA
+    MOVLW 'r'
+    CALL SEND_LCD_DATA
+    MOVLW ' '
+    CALL SEND_LCD_DATA
+    MOVLW '1'
+    CALL SEND_LCD_DATA
+
+    ; Line 2: Set cursor to second line, first position
+    MOVLW 0xC0
+    MOVWF CURSOR
+    CALL SEND_LCD_COMMAND
+
+
+
+; Load ASCII '0'
+; Load ASCII '0' into TEMP_W
+MOVLW '0'
+MOVWF TEMP_W
+
+; Print 6 integer digits
+MOVLW D'6'
+MOVWF MCount
+
+PRINT_INT:
+    MOVLW '0'       ; Always display ASCII '0' initially
+    CALL SEND_LCD_DATA
+    DECFSZ MCount, F
+    GOTO PRINT_INT
+
+; Print decimal point
+MOVLW '.'
+CALL SEND_LCD_DATA
+
+; Print 6 decimal digits
+MOVLW '0'          ; <- CRUCIAL: make sure this is reloaded
+MOVWF TEMP_W
+
+MOVLW D'6'
+MOVWF MCount
+PRINT_DEC:
+    MOVF TEMP_W, 0
+    CALL SEND_LCD_DATA
+    DECFSZ MCount, F
+    GOTO PRINT_DEC
+
+MOVLW 0xC0     ; Move cursor to beginning of line 2
+MOVWF CURSOR
+CALL SEND_LCD_COMMAND
+
+
+; Enable blinking cursor
+MOVLW 0x0E
+CALL SEND_LCD_COMMAND
+
+
+
+
+    ; Re-enable interrupts
+    BCF INTCON, INTF
+    BCF PIR1, TMR1IF
+    BSF INTCON, INTE
+    BSF INTCON, GIE
+    RETURN
+
+
+;================================================================================
+; WELCOME_BLINK_LOOP – blink “Welcome to Division” 3×
+;================================================================================
+WELCOME_BLINK_LOOP:
+    MOVLW   D'3'
+    MOVWF   INITIAL_MESSAGE_COUNTER
+
+BLINK_CYCLE:
+    ; clear entire display
+    MOVLW   0x01
+    CALL    SEND_LCD_COMMAND
+    CALL    xms_500ms
+
+    ; line 1: “Welcome to”
+    MOVLW   0x80
+    CALL    SEND_LCD_COMMAND
+    MOVLW   'W'
+    CALL    SEND_LCD_DATA
+    MOVLW   'e'
+    CALL    SEND_LCD_DATA
+    MOVLW   'l'
+    CALL    SEND_LCD_DATA
+    MOVLW   'c'
+    CALL    SEND_LCD_DATA
+    MOVLW   'o'
+    CALL    SEND_LCD_DATA
+    MOVLW   'm'
+    CALL    SEND_LCD_DATA
+    MOVLW   'e'
+    CALL    SEND_LCD_DATA
+    MOVLW   ' '
+    CALL    SEND_LCD_DATA
+    MOVLW   't'
+    CALL    SEND_LCD_DATA
+    MOVLW   'o'
+    CALL    SEND_LCD_DATA
+
+    ; line 2: “Division”
+    MOVLW   0xC0
+    CALL    SEND_LCD_COMMAND
+    MOVLW   'D'
+    CALL    SEND_LCD_DATA
+    MOVLW   'i'
+    CALL    SEND_LCD_DATA
+    MOVLW   'v'
+    CALL    SEND_LCD_DATA
+    MOVLW   'i'
+    CALL    SEND_LCD_DATA
+    MOVLW   's'
+    CALL    SEND_LCD_DATA
+    MOVLW   'i'
+    CALL    SEND_LCD_DATA
+    MOVLW   'o'
+    CALL    SEND_LCD_DATA
+    MOVLW   'n'
+    CALL    SEND_LCD_DATA
+
+    CALL    xms_500ms
+
+    DECFSZ  INITIAL_MESSAGE_COUNTER, F
+    GOTO    BLINK_CYCLE
+
+    ; final clear & short pause before Number 1
+    MOVLW   0x01
+    CALL    SEND_LCD_COMMAND
+    MOVLW   D'100'
+    CALL    xms_500ms
+    RETURN
+
+xms_500ms:
+    MOVLW D'125'
+    CALL xms
+    RETURN
+
+PRINT_EQUAL:
+    ; Clear LCD
+    MOVLW 0x01
+    CALL SEND_LCD_COMMAND
+    MOVLW   0x80        ; DDRAM addr 0x00 ? line 1, col 1
+    CALL    SEND_LCD_COMMAND
+    MOVLW   '='
+    CALL    SEND_LCD_DATA
+    RETURN
+
+SHOW_RESULT:
+    BANKSEL INTCON
+    BCF     INTCON, T0IE    ; stop Timer0 overflows
+    BCF     INTCON, INTE    ; stop RB0/INT0
+
+    BANKSEL RESULT_DISPLAY_MODE
+    MOVLW   0x01
+    MOVWF   RESULT_DISPLAY_MODE
+
+    ; clear display
+    MOVLW   0x01
+    CALL    SEND_LCD_COMMAND
+
+    ; “RESULT” on line 1
+    MOVLW   0x80
+    CALL    SEND_LCD_COMMAND
+    MOVLW 'R' 
+    CALL SEND_LCD_DATA
+    MOVLW 'E' 
+    CALL SEND_LCD_DATA
+    MOVLW 'S' 
+    CALL SEND_LCD_DATA
+    MOVLW 'U' 
+    CALL SEND_LCD_DATA
+    MOVLW 'L' 
+    CALL SEND_LCD_DATA
+    MOVLW 'T' 
+    CALL SEND_LCD_DATA
+
+    ; digits on line 2
+    MOVLW   0xC0
+    CALL    SEND_LCD_COMMAND
+    CALL    Print_Result_Digits
+
+    ; reset
+    BANKSEL DATA_COMPLETE
+    CLRF    DATA_COMPLETE
+    BANKSEL INTCON
+    BSF     INTCON, INTE
+    BSF     INTCON, GIE
+    RETFIE
+
+SHOW_NUM1:
+    ; Clear LCD
+    MOVLW 0x01
+    CALL SEND_LCD_COMMAND
+    MOVLW   0x80        ; DDRAM addr 0x00 ? line 1, col 1
+
+    ;BANKSEL C1
+    MOVF    C1, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    C2, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    C3, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    C4, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    C5, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    C6, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    ; 5) Print decimal point
+    MOVLW   '.'
+    CALL    SEND_LCD_DATA
+
+    ; 6) Print the six fractional digits of Number 2
+    MOVF    C7, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    C8, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    C9, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    C10, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    C11, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    C12, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    RETFIE
+
+SHOW_NUM2:
+    MOVLW   0x01
+    CALL    SEND_LCD_COMMAND
+
+    BANKSEL R2_C1
+    MOVF    R2_C1, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    R2_C2, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    R2_C3, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    R2_C4, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    R2_C5, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    R2_C6, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVLW   '.'
+    CALL    SEND_LCD_DATA
+
+    MOVF    R2_C7, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    R2_C8, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    R2_C9, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    R2_C10, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    R2_C11, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    MOVF    R2_C12, W
+    ADDLW   '0'
+    CALL    SEND_LCD_DATA
+
+    RETFIE
+
+
+
+
+;——————————————————————————————————
+; Print_Result_Digits
+; prints D1..D6, “.”, D7..D12 at the current LCD cursor
+;——————————————————————————————————
+Print_Result_Digits:
+
+    BANKSEL INTCON
+    BCF     INTCON, T0IE    ; stop Timer0 overflows
+    BCF     INTCON, INTE    ; stop RB0/INT0
+    ; clear display
+
+    BANKSEL D1               ; pick the bank that holds D1 D12
+    ;  six integer digits  
+    MOVF   D12, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    MOVF   D11, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    MOVF   D10, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    MOVF   D9, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    MOVF   D8, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    MOVF   D7, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    ;  decimal point  
+    MOVLW  '.'
+    CALL   SEND_LCD_DATA
+
+    ;  six fractional digits  
+    MOVF   D6, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    MOVF   D5, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    MOVF   D4, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    MOVF   D3, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    MOVF   D2, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    MOVF   D1, W
+    ADDLW  '0'
+    CALL   SEND_LCD_DATA
+
+    RETURN
+
+; ==========================================================================
+;							NUMBERS & CONVERSIONS
+;											  
+; ===========================================================================
+
+dec2bin16
+    movf  C4,W        ; (C4 + C2) * 2
+    addwf C2,W
+    movwf NUMLO
+    rlf   NUMLO,F
+
+    swapf C3,W        ; + C3 * 16 + C3
+    addwf C3,W
+    addwf NUMLO,F
+
+    rlf   C1,W        ; + (C1 * 2 + C2) * 256
+    addwf C2,W
+    movwf NUMHI
+
+    rlf   NUMLO,F     ; * 2
+    rlf   NUMHI,F
+
+    swapf C2,W        ; - C2 * 16
+    subwf NUMLO,F
+    skpc
+    decf  NUMHI,F
+
+    swapf C3,W        ; + C3 * 16 + C4
+    addwf C4,W
+    addwf NUMLO,F
+    skpnc
+    incf  NUMHI,F
+
+    swapf C1,W        ; + C1 * 16 + C5
+    addwf C5,W
+
+    rlf   NUMLO,F     ; * 2
+    rlf   NUMHI,F
+
+    addwf NUMLO,F
+    skpnc
+    incf  NUMHI,F
+
+    movf  C1,W        ; - C1 * 256
+    subwf NUMHI,F
+
+    swapf C1,W        ; + C1 * 16 * 256 * 2
+    addwf NUMHI,F
+    addwf NUMHI,F
+
+    return            ; Q.E.D.
+
+
+       
+
+; ==========================================================================
+;						INCREMENTS
+;											  
+; ===========================================================================
+
+NORMALIZE_NUMBER:
+	MOVLW 6
+	ADDWF DIGIT1, 0
+	MOVWF DIGIT1
+	SUBLW 0x39			; CHECK IF IT HAS EXCEEDED '9'
+	BTFSC STATUS, 0		; NUMBER IS NEGATIVE
+	GOTO NORMALIZE_NUMBER_2
+	MOVLW D'10'
+	SUBWF DIGIT1, 1
+	INCF DIGIT2
+NORMALIZE_NUMBER_2:
+	MOVLW 3
+	ADDWF DIGIT2, 0
+	MOVWF DIGIT2
+	SUBLW 0x39		; CHECK IF IT HAS EXCEEDED '9'
+	BTFSC STATUS, 0		; NUMBER IS NEGATIVE
+	GOTO NORMALIZE_NUMBER_3
+	MOVLW D'10'
+	SUBWF DIGIT2, 1
+	INCF DIGIT3
+NORMALIZE_NUMBER_3:
+	MOVLW 5
+	ADDWF DIGIT3, 0
+	MOVWF DIGIT3
+	SUBLW 0x39			; CHECK IF IT HAS EXCEEDED '9'
+	BTFSC STATUS, 0		; NUMBER IS NEGATIVE
+	GOTO NORMALIZE_NUMBER_4
+	MOVLW D'10'
+	SUBWF DIGIT3, 1
+	INCF DIGIT4
+NORMALIZE_NUMBER_4:
+	MOVLW 5
+	ADDWF DIGIT4, 0
+	MOVWF DIGIT4
+	SUBLW 0x39			; CHECK IF IT HAS EXCEEDED '9'
+	BTFSC STATUS, 0		; NUMBER IS NEGATIVE
+	GOTO NORMALIZE_NUMBER_5
+	MOVLW D'10'
+	SUBWF DIGIT4, 1
+	INCF DIGIT5
+NORMALIZE_NUMBER_5:
+	MOVLW 6
+	ADDWF DIGIT5, 0
+	MOVWF DIGIT5
+	SUBLW 0x39			; CHECK IF IT HAS EXCEEDED '9'
+	BTFSC STATUS, 0		; NUMBER IS NEGATIVE
+	GOTO NORMALIZE_NUMBER_6
+	MOVLW D'10'	
+	SUBWF DIGIT5, 1
+	INCF DIGIT6
+NORMALIZE_NUMBER_6:
+	RETURN
+
+sendDataToAuxiliary:
+
+   	BANKSEL TRISC
+	CLRF    TRISC       ; portc is output 
+	BANKSEL PORTC
+	MOVLW 0x18
+	MOVWF DIGIT_COUNTER
+
+SEND_LOOP:
+	CALL    GET_BYTE_ADDR    ; returns literal address in W
+   	BANKSEL PORTC
+	
+    MOVWF   FSR              ; FSR ? file-address
+    MOVF    INDF, W          ; W ? [FSR]
+    MOVWF   PORTC           ; Put byte on PORT C
+	MOVLW   D'100'
+    CALL    xms         ; delay for 10ms to make sure the data is sent
+	
+    BANKSEL PORTB
+	MOVF  PORTB, W     ; W = PORTB
+    XORLW D'16'         ; toggle bit4 (0x10 mask)
+    MOVWF PORTB        ; write back, only bit4 flips
+    NOP
+    
+    
+    WAIT_ACK:
+    BTFSC   PORTB, 2        ; Wait for ACK from slave
+    GOTO    WAIT_ACK
+	
+	; Wait for ACK to go high again
+    WAIT_ACK_HIGH:
+    BTFSS   PORTB, 2
+    GOTO    WAIT_ACK_HIGH
+
+    MOVLW   D'100'
+    CALL    xms         ; delay for 10ms to make sure the data is sent
+
+    ;MOVLW   D'100'
+    ;CALL    xms         ; delay for 10ms to make sure the data is sent
+	DECFSZ DIGIT_COUNTER,1
+	GOTO SEND_LOOP
+	MOVLW   b'11111111'
+	MOVF PORTC
+	BANKSEL TRISC
+    MOVLW   b'11111111'
+    MOVWF   TRISC        ; PORTC all inputs
+    CALL    RECEIVE_DATA_FROM_AUXILIARY_SETUP
+    RETURN
+
+; FIRST SEND BYTES R1 12->1 THEN SEND BYTES r2 12->1
+GET_BYTE_ADDR:
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'1'
+		BTFSC STATUS, Z
+        RETLW   R2_C12            ; index==1 ? 0x40
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'2'
+		BTFSC STATUS, Z
+        RETLW   R2_C11            ; index==2 ? 0x41
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'3'
+		BTFSC STATUS, Z
+        RETLW   R2_C10
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'4'
+		BTFSC STATUS, Z
+        RETLW   R2_C9
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'5'
+		BTFSC STATUS, Z
+        RETLW   R2_C8
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'6'
+		BTFSC STATUS, Z
+        RETLW   R2_C7            ; index==6 ? 0x61
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'7'
+		BTFSC STATUS, Z
+        RETLW   R2_C6
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'8'
+		BTFSC STATUS, Z
+        RETLW   R2_C5
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'9'
+		BTFSC STATUS, Z
+        RETLW   R2_C4
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'10'
+		BTFSC STATUS, Z
+        RETLW   R2_C3
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'11'
+		BTFSC STATUS, Z
+        RETLW   R2_C2
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'12'
+		BTFSC STATUS, Z
+        RETLW   R2_C1 
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'13'
+		BTFSC STATUS, Z
+		RETLW   C12          
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'14'
+		BTFSC STATUS, Z
+        RETLW   C11 
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'15'
+		BTFSC STATUS, Z
+        RETLW   C10 
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'16'
+		BTFSC STATUS, Z
+        RETLW   C9 
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'17'
+		BTFSC STATUS, Z
+        RETLW   C8 
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'18'
+		BTFSC STATUS, Z
+        RETLW   C7 
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'19'
+		BTFSC STATUS, Z
+        RETLW   C6 
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'20'
+		BTFSC STATUS, Z
+        RETLW   C5 
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'21'
+		BTFSC STATUS, Z
+        RETLW   C4 
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'22'
+		BTFSC STATUS, Z
+        RETLW   C3 
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'23'
+		BTFSC STATUS, Z
+        RETLW   C2 
+        RETLW   C1 
+
+
+RECEIVE_DATA_FROM_AUXILIARY_SETUP:
+    ; disable timer and button interrupts
+    BANKSEL INTCON
+    BCF     INTCON, T0IE    ; stop Timer0 overflows
+    BCF     INTCON, INTE    ; stop RB0/INT0
+	BCF		INTCON, GIE
+
+
+
+	; Setup PORTB pins BEFORE enabling interrupts
+    BANKSEL TRISB
+    BSF     TRISB, 2     ; RB2 = input (ACK line)
+    BSF     TRISB, 4     ; RB4 = input (interrupt from SLAVE)
+
+	; Set PORTB latches
+    BANKSEL PORTB
+    BCF     PORTB, 2     ; Ensure RB2 latch = 0 for when we make it output
+	
+	; CRITICAL: Read PORTB to clear mismatch condition
+    MOVF    PORTB, W     ; First read
+    MOVF    PORTB, W     ; Second read
+    MOVF    PORTB, W     ; Third read - ensure clean state
+
+	; Initialize digit counter and completion flag
+    CLRF    DIGIT_COUNTER   ; DIGIT_COUNTER = 0
+    CLRF    DATA_COMPLETE   ; Clear completion flag
+
+	; Small delay before enabling
+    MOVLW   D'10'
+    CALL    xms
+    
+    ; NOW setup interrupts
+    BANKSEL INTCON
+    BCF     INTCON, RBIF    ; Clear any existing RB interrupt flag AFTER port setup
+    BSF     INTCON, RBIE    ; Enable RB interrupt on change
+    BSF     INTCON, GIE     ; Enable global interrupts
+    RETURN
+
+HANDEL_RECEIVED_DATA:
+	BANKSEL PORTB
+    MOVF    PORTB, W        ; Read PORTB to clear mismatch condition
+	BANKSEL INTCON
+	BCF   INTCON, RBIF    ; CLEAR INTERRUPT BIT
+
+	; Read PORTB to clear mismatch
+	BANKSEL PORTB
+    MOVF    PORTB, W
+	
+	; Add delay for data stability
+    MOVLW   D'5'
+    CALL    xms
+
+	BANKSEL PORTC
+    MOVF    PORTC, W        ; Read 
+	MOVWF   Temp      ; Store converted digit temporarily
+								
+    INCF    DIGIT_COUNTER, F   ; Increment digit counter FIRST
+    MOVF    DIGIT_COUNTER, W
+
+	; REVERSED THE ORDER SINCE SLAVE SENDS MSB BIYTE FIRST
+    SUBLW   D'12'
+    BTFSC   STATUS, Z
+    GOTO    STORE_D1
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'11'
+    BTFSC   STATUS, Z
+    GOTO    STORE_D2
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'10'
+    BTFSC   STATUS, Z
+    GOTO    STORE_D3
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'9'
+    BTFSC   STATUS, Z
+    GOTO    STORE_D4
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'8'
+    BTFSC   STATUS, Z
+    GOTO    STORE_D5
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'7'
+    BTFSC   STATUS, Z
+    GOTO    STORE_D6
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'6'
+    BTFSC   STATUS, Z
+    GOTO    STORE_D7
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'5'
+    BTFSC   STATUS, Z
+    GOTO    STORE_D8
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'4'
+    BTFSC   STATUS, Z
+    GOTO    STORE_D9
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'3'
+    BTFSC   STATUS, Z
+    GOTO    STORE_D10
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'2'
+    BTFSC   STATUS, Z
+    GOTO    STORE_D11
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'1'
+    BTFSC   STATUS, Z
+    GOTO    STORE_D12
+
+	; If we get here, counter is out of range - ignore
+    GOTO    SEND_ACK
+
+STORE_D1:
+    MOVF    Temp, W
+    MOVWF   D1
+    GOTO    DIGIT_STORED
+
+STORE_D2:
+    MOVF    Temp, W
+    MOVWF   D2
+    GOTO    DIGIT_STORED
+
+STORE_D3:
+    MOVF    Temp, W
+    MOVWF   D3
+    GOTO    DIGIT_STORED
+
+STORE_D4:
+    MOVF    Temp, W
+    MOVWF   D4
+    GOTO    DIGIT_STORED
+
+STORE_D5:
+    MOVF    Temp, W
+    MOVWF   D5
+    GOTO    DIGIT_STORED
+
+STORE_D6:
+    MOVF    Temp, W
+    MOVWF   D6
+    GOTO    DIGIT_STORED
+
+STORE_D7:
+    MOVF    Temp, W
+    MOVWF   D7
+    GOTO    DIGIT_STORED
+
+STORE_D8:
+    MOVF    Temp, W
+    MOVWF   D8
+    GOTO    DIGIT_STORED
+
+STORE_D9:
+    MOVF    Temp, W
+    MOVWF   D9
+    GOTO    DIGIT_STORED
+
+STORE_D10:
+    MOVF    Temp, W
+    MOVWF   D10
+    GOTO    DIGIT_STORED
+
+STORE_D11:
+    MOVF    Temp, W
+    MOVWF   D11
+    GOTO    DIGIT_STORED
+
+STORE_D12:
+    MOVF    Temp, W
+    MOVWF   D12
+    GOTO    DIGIT_STORED
+
+DIGIT_STORED:
+    GOTO    SEND_ACK
+
+SEND_ACK:
+    
+    ; Send ACK by pulling RB2 low
+    BANKSEL TRISB
+    BCF     TRISB, 2        ; RB2 = output (pulls line low)
+    
+    MOVLW   D'50'          ; Reduced delay (1000ms is too long)
+    CALL    xms
+    
+    ; Release ACK line
+    BANKSEL TRISB
+    BSF     TRISB, 2        ; RB2 = input (external pull-up brings back high)
+    
+	BANKSEL STATUS
+	BCF STATUS,Z ; CLEAR THE ZERO FLAG
+	MOVLW D'12'
+	SUBWF DIGIT_COUNTER,0 ; TEST IF ALL DIGITS HAVE BEEN RECEIVED
+	BTFSC STATUS,Z ; IF Z IS CLEAR, THEN NOT ALL DIGITS HAVE BEEN RECEIVED YET
+    GOTO    SET_COMPLETION_FLAG
+    BANKSEL INTCON
+    RETFIE                    ; Return from interrupt
+
+SET_COMPLETION_FLAG:
+    ; Set flag to indicate all data received
+	BANKSEL PORTC
+	MOVLW D'1'
+	MOVF DATA_COMPLETE
+
+    BANKSEL INTCON
+    BCF     INTCON, RBIE    ; Disable RB interrupt on change	
+    BSF     INTCON, INTE
+    BSF     INTCON, GIE
+	GOTO SHOW_RESULT
+
+loop:
+	GOTO loop
+	END                  ; End of the program

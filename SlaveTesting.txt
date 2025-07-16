@@ -1,0 +1,2166 @@
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;
+;   Project:   Complex Calculator   
+;   File:   auxiliary.asm
+;   Date:   2025-07
+;   -----------------------------------
+;
+;   Auxiliary CPU will handle the DIVISION 
+;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+    
+    PROCESSOR 16F877A
+    ;	Clock = XT 4MHz, standard fuse settings
+
+    INCLUDE "P16F877A.INC"	; Include the 16F877 header file
+    
+	;__CONFIG 0x3731	; 00011011100110001
+ __CONFIG _HS_OSC & _WDT_OFF & _PWRTE_ON & _BODEN_OFF & _LVP_OFF
+SCALE_FACTOR           EQU     1000000     ; 1e6 decimal scaling factor
+
+
+
+; =============================================================================
+; VARIABLE MEMORY ALLOCATION
+; =============================================================================
+
+; --- System Variables (0x20–0x2F) ---
+CBLOCK 0x20
+    DIGIT_COUNT         ; 0x20
+    TEMP_DIGIT          ; 0x21
+    DIGIT_COUNTER       ; 0x22
+    FSR_TEMP2           ; 0x23
+    D1                  ; 0x24
+    D2                  ; 0x25
+    D3                  ; 0x26
+    D4                  ; 0x27
+    D5                  ; 0x28
+    D6                  ; 0x29
+    D7                  ; 0x2A
+    D8                  ; 0x2B
+    D9                  ; 0x2C
+    D10                 ; 0x2D
+    D11                 ; 0x2E
+    D12                 ; 0x2F
+ENDC
+
+; --- Number Storage Arrays (0x4F–0x66) ---
+CBLOCK 0x4F
+    R2_C1               ; 0x4F
+    R2_C2               ; 0x50
+    R2_C3               ; 0x51
+    R2_C4               ; 0x52
+    R2_C5               ; 0x53
+    R2_C6               ; 0x54
+    R2_C7               ; 0x55
+    R2_C8               ; 0x56
+    R2_C9               ; 0x57
+    R2_C10              ; 0x58
+    R2_C11              ; 0x59
+    R2_C12              ; 0x5A
+    R1_C1               ; 0x5B
+    R1_C2               ; 0x5C
+    R1_C3               ; 0x5D
+    R1_C4               ; 0x5E
+    R1_C5               ; 0x5F
+    R1_C6               ; 0x60
+    R1_C7               ; 0x61
+    R1_C8               ; 0x62
+    R1_C9               ; 0x63
+    R1_C10              ; 0x64
+    R1_C11              ; 0x65
+    R1_C12              ; 0x66
+ENDC
+
+
+
+; --- 32-bit Mathematical Registers (0xA0–0xFF) ---
+CBLOCK 0xA0
+    NUMERATOR:8         ; 0xA0–0xA7
+    DENOMINATOR:8       ; 0xA8–0xAF
+    RESULT:8            ; 0xB0–0xB7
+    SCRATCH:8           ; 0xB8–0xBF
+    MULTIPLIER:4        ; 0xC0–0xC3
+    TEMP_64:8           ; 0xC4–0xCB
+    TEMP_DIVISOR:8      ; 0xCC–0xD3
+    TEMP_QUOTIENT:8     ; 0xDC–0xE3
+    TEMP_REMAINDER:8    ; 0xE4–0xEB
+    TEMP_CURRENT_BYTE   ; 0xEC
+    TEMP_DIVIDEND_HIGH:2; 0xED–0xEE
+    TEMP_DIVIDEND_LOW:2 ; 0xEF–0xF0
+    TEMP_QUOTIENT_BYTE  ; 0xF1
+    TEMP_INTEGER:8      ; 0xF2–0xF9
+    TEMP_BIT_COUNT      ; 0xFA
+    BYTE_COUNT          ; 0xFB
+ENDC
+
+
+
+
+
+
+; Program Begins ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+    ORG	0x00        ; Default start address 
+    NOP             ; required for ICD mode
+    CALL    start   ; Jump to the start of the program
+	;CALL CONVERT_TO_64BIT
+	call sendResult
+	GOTO LOOP
+    
+
+; Interrupt vector location ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+    ORG	0x04		; Interrupt vector location
+    NOP
+    GOTO    ISR
+
+ISR:
+    BTFSC   INTCON, RBIF    ; Check if RB interrupt
+    GOTO    HANDLE_DATA
+	GOTO LOOP
+    retfie 
+
+INCLUDE "LCDIS.INC"	; Include the LCD driver file
+
+; Corrected initialization sequence
+
+
+start:
+    CLRF R1_C1
+    CLRF R1_C2
+    CLRF R1_C3
+    CLRF R1_C4
+    CLRF R1_C5
+    CLRF R1_C6
+    CLRF R1_C7
+    CLRF R1_C8
+    CLRF R1_C9
+    CLRF R1_C10
+    CLRF R1_C11
+    CLRF R1_C12
+	CLRF R2_C1
+    CLRF R2_C2
+    CLRF R2_C3
+    CLRF R2_C4
+    CLRF R2_C5
+    CLRF R2_C6
+    CLRF R2_C7
+    CLRF R2_C8
+    CLRF R2_C9
+    CLRF R2_C10
+    CLRF R2_C11
+    CLRF R2_C12
+	CLRF    DIGIT_COUNTER
+	CLRF    DIGIT_COUNT
+    
+    ; Setup PORTD for LED output
+    BANKSEL TRISD
+    BCF     TRISD, 0     ; RD0 is output for LED
+	BCF     TRISD, 1     ; RD1 is output for LED GREEN
+    BANKSEL PORTD
+    CLRF    PORTD        ; LED off initially
+    
+    ; Setup PORTC for input (data from master)
+    BANKSEL PORTC
+    CLRF    PORTC
+    BANKSEL TRISC
+    MOVLW   0xFF
+    MOVWF   TRISC        ; PORTC all inputs
+    
+    ; Setup PORTB pins BEFORE enabling interrupts
+    BANKSEL TRISB
+    BSF     TRISB, 2     ; RB2 = input (ACK line)
+    BSF     TRISB, 4     ; RB4 = input (interrupt from master)
+    
+    ; Set PORTB latches
+    BANKSEL PORTB
+    BCF     PORTB, 2     ; Ensure RB2 latch = 0 for when we make it output
+    
+    ; CRITICAL: Read PORTB to clear mismatch condition
+    MOVF    PORTB, W     ; Read PORTB to clear any mismatch
+    
+    ; NOW setup interrupts
+    BANKSEL INTCON
+    BCF     INTCON, RBIF    ; Clear any existing RB interrupt flag AFTER port setup
+    BSF     INTCON, RBIE    ; Enable RB interrupt on change
+    BSF     INTCON, GIE     ; Enable global interrupts
+    
+	RETURN
+    ;GOTO    LOOP ; !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! CHANGED FOR TESTING
+	;GOTO	 HANDLE_COMPLETE
+
+; keep iterating until a new value is received
+HANDLE_DATA:
+	BANKSEL PORTB
+    MOVF    PORTB, W        ; Read PORTB to clear mismatch condition
+	BANKSEL INTCON
+	BCF   INTCON, RBIF    ; CLEAR INTERRUPT BIT
+    BANKSEL PORTC
+    MOVF    PORTC, W        ; Read ASCII data from PORT C
+	MOVWF   TEMP_DIGIT      ; Store converted digit temporarily
+    ; Convert ASCII to digit (subtract 0x30)
+    ; MOVLW   D'48'            ; Subtract ASCII offset
+	; SUBWF TEMP_DIGIT,1
+	BANKSEL PORTD
+    
+    ; Check which digit position we're at
+    MOVF    DIGIT_COUNTER, W
+    
+   ; Check each possible value following your original jump table order
+    SUBLW   D'0'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R1_C12    ; DIGIT_COUNTER = 0
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'1'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R1_C11    ; DIGIT_COUNTER = 1
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'2'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R1_C10    ; DIGIT_COUNTER = 2
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'3'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R1_C9     ; DIGIT_COUNTER = 3
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'4'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R1_C8     ; DIGIT_COUNTER = 4
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'5'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R1_C7     ; DIGIT_COUNTER = 5
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'6'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R1_C6     ; DIGIT_COUNTER = 6
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'7'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R1_C5     ; DIGIT_COUNTER = 7
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'8'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R1_C4     ; DIGIT_COUNTER = 8
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'9'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R1_C3     ; DIGIT_COUNTER = 9
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'10'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R1_C2     ; DIGIT_COUNTER = 10
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'11'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R1_C1     ; DIGIT_COUNTER = 11
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'12'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R2_C12    ; DIGIT_COUNTER = 12
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'13'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R2_C11    ; DIGIT_COUNTER = 13
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'14'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R2_C10    ; DIGIT_COUNTER = 14
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'15'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R2_C9     ; DIGIT_COUNTER = 15
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'16'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R2_C8     ; DIGIT_COUNTER = 16
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'17'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R2_C7     ; DIGIT_COUNTER = 17
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'18'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R2_C6     ; DIGIT_COUNTER = 18
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'19'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R2_C5     ; DIGIT_COUNTER = 19
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'20'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R2_C4     ; DIGIT_COUNTER = 20
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'21'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R2_C3     ; DIGIT_COUNTER = 21
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'22'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R2_C2     ; DIGIT_COUNTER = 22
+    
+    MOVF    DIGIT_COUNTER, W
+    SUBLW   D'23'
+    BTFSC   STATUS, Z
+    GOTO    STORE_R2_C1     ; DIGIT_COUNTER = 23
+    
+    ; If we get here, DIGIT_COUNTER is out of range
+    GOTO    DIGIT_STORED    ; Skip storage or handle error
+
+STORE_R1_C1:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R1_C1
+    GOTO    DIGIT_STORED
+
+STORE_R1_C2:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R1_C2
+    GOTO    DIGIT_STORED
+
+STORE_R1_C3:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R1_C3
+    GOTO    DIGIT_STORED
+
+STORE_R1_C4:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R1_C4
+    GOTO    DIGIT_STORED
+
+STORE_R1_C5:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R1_C5
+    GOTO    DIGIT_STORED
+
+STORE_R1_C6:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R1_C6
+    GOTO    DIGIT_STORED
+
+STORE_R1_C7:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R1_C7
+    GOTO    DIGIT_STORED
+
+STORE_R1_C8:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R1_C8
+    GOTO    DIGIT_STORED
+
+STORE_R1_C9:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R1_C9
+    GOTO    DIGIT_STORED
+
+STORE_R1_C10:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R1_C10
+    GOTO    DIGIT_STORED
+
+STORE_R1_C11:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R1_C11
+    GOTO    DIGIT_STORED
+
+STORE_R1_C12:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R1_C12
+    GOTO    DIGIT_STORED
+
+STORE_R2_C1:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R2_C1
+    GOTO    DIGIT_STORED
+
+STORE_R2_C2:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R2_C2
+    GOTO    DIGIT_STORED
+
+STORE_R2_C3:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R2_C3
+    GOTO    DIGIT_STORED
+
+STORE_R2_C4:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R2_C4
+    GOTO    DIGIT_STORED
+
+STORE_R2_C5:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R2_C5
+    GOTO    DIGIT_STORED
+
+STORE_R2_C6:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R2_C6
+    GOTO    DIGIT_STORED
+
+STORE_R2_C7:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R2_C7
+    GOTO    DIGIT_STORED
+
+STORE_R2_C8:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R2_C8
+    GOTO    DIGIT_STORED
+
+STORE_R2_C9:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R2_C9
+    GOTO    DIGIT_STORED
+
+STORE_R2_C10:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R2_C10
+    GOTO    DIGIT_STORED
+
+STORE_R2_C11:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R2_C11
+    GOTO    DIGIT_STORED
+
+STORE_R2_C12:
+    MOVF    TEMP_DIGIT, W
+    MOVWF   R2_C12
+    GOTO    DIGIT_STORED
+
+DIGIT_STORED:
+    ; Increment digit counter
+    INCF    DIGIT_COUNTER, F
+    GOTO    SEND_ACK
+
+HANDLE_COMPLETE:
+    ; All 24 digits received, ready for calculation
+    ; Reset digit counter for next operation
+	BANKSEL PORTC
+    CLRF    DIGIT_COUNTER
+    CALL    CONVERT_TO_64BIT ; DO THE CONVERTION DIVITION AND DECOMPOSITION
+	CALL start
+	RETFIE	; Return from interrupt
+SEND_ACK:
+    BANKSEL PORTD
+    BSF     PORTD, 0        ; Turn ON LED (don't toggle, just turn on)
+    
+    ; Send ACK by pulling RB2 low
+    BANKSEL TRISB
+    BCF     TRISB, 2        ; RB2 = output (pulls line low)
+    
+    MOVLW   D'50'          ; Reduced delay (1000ms is too long)
+    CALL    xms
+    
+    ; Release ACK line
+    BANKSEL TRISB
+    BSF     TRISB, 2        ; RB2 = input (external pull-up brings back high)
+    
+    ; Turn off LED after a short delay
+    MOVLW   D'50'
+    CALL    xms
+    BANKSEL PORTD
+    BCF     PORTD, 0        ; Turn OFF LED
+	BANKSEL STATUS
+	BCF STATUS,Z ; CLEAR THE ZERO FLAG
+	MOVLW D'24'
+	SUBWF DIGIT_COUNTER,0 ; TEST IF ALL DIGITS HAVE BEEN RECEIVED
+	BTFSC STATUS,Z ; IF Z IS CLEAR, THEN NOT ALL DIGITS HAVE BEEN RECEIVED YET
+    GOTO HANDLE_COMPLETE
+    BANKSEL INTCON
+    RETFIE                    ; Return from interrupt
+
+; --- Test Examples ---
+; Example 1: Load 123456.789012 into R1
+LOAD_TEST_R1:
+    MOVLW 6
+    MOVWF R1_C12    ; hundred thousands
+    MOVLW 5
+    MOVWF R1_C11    ; ten thousands  
+    MOVLW 4
+    MOVWF R1_C10    ; thousands
+    MOVLW 3
+    MOVWF R1_C9     ; hundreds
+    MOVLW 2
+    MOVWF R1_C8     ; tens
+    MOVLW 1
+    MOVWF R1_C7     ; units
+    MOVLW 1
+    MOVWF R1_C6     ; tenths
+    MOVLW 2
+    MOVWF R1_C5     ; hundredths
+    MOVLW 3
+    MOVWF R1_C4     ; thousandths
+    MOVLW 4
+    MOVWF R1_C3     ; ten thousandths
+    MOVLW 5
+    MOVWF R1_C2     ; hundred thousandths
+    MOVLW 6
+    MOVWF R1_C1     ; millionths
+    RETURN
+
+; Example 2: Load 654321.123456 into R2  
+LOAD_TEST_R2:
+    MOVLW 1
+    MOVWF R2_C12    ; hundred thousands
+    MOVLW 2
+    MOVWF R2_C11    ; ten thousands
+    MOVLW 3
+    MOVWF R2_C10    ; thousands
+    MOVLW 4
+    MOVWF R2_C9     ; hundreds
+    MOVLW 5
+    MOVWF R2_C8     ; tens
+    MOVLW 6
+    MOVWF R2_C7     ; units
+    MOVLW 7
+    MOVWF R2_C6     ; tenths
+    MOVLW 8
+    MOVWF R2_C5     ; hundredths
+    MOVLW 9
+    MOVWF R2_C4     ; thousandths
+    MOVLW 0
+    MOVWF R2_C3     ; ten thousandths
+    MOVLW 1
+    MOVWF R2_C2     ; hundred thousandths
+    MOVLW 2
+    MOVWF R2_C1     ; millionths
+    RETURN
+
+
+CONVERT_TO_64BIT:
+	BANKSEL PORTC
+    CALL LOAD_TEST_R1
+    CALL LOAD_TEST_R2
+    
+    ; ----- Convert R1 (12 digits) to NUMERATOR -----
+    MOVLW R1_C12       ; Start from MSB (Most Significant Digit)
+    MOVWF FSR_TEMP2          ; Set FSR to point to R1_C12
+    BANKSEL NUMERATOR
+    CALL BUF_TO_64BIT_FIXED  ; Convert to 32-bit fixed-point, result in NUMERATOR
+    
+    ; Temporarily store NUMERATOR in TEMP_64
+    CALL COPY_NUMERATOR_TO_TEMP2
+    
+    ; ----- Convert R2 (12 digits) to DENOMINATOR -----
+    BANKSEL PORTC
+    MOVLW R2_C12       ; Start from MSB
+    MOVWF FSR_TEMP2          ; Set FSR to point to R2_C12
+    BANKSEL NUMERATOR
+    
+    ; Convert R2 to DENOMINATOR (reuse BUF_TO_32BIT_FIXED, result goes to NUMERATOR)
+    CALL BUF_TO_64BIT_FIXED
+    
+    ; Move result to DENOMINATOR
+    CALL COPY_NUMERATOR_TO_DENOMINATOR
+    
+    ; Restore original NUMERATOR from TEMP_64
+    CALL COPY_TEMP2_TO_NUMERATOR
+    GOTO FIXED_DIVIDE_64BIT
+
+
+; --- Convert 12-digit buffer to 32-bit fixed-point integer ---
+; Input: FSR points to MSB (most significant digit)
+; Output: 32-bit fixed-point result in NUMERATOR (scaled by 10^6)
+; Format: 6 integer digits + 6 fractional digits = IIIIII.FFFFFF
+BUF_TO_64BIT_FIXED:
+    ; Initialize NUMERATOR to 0
+    CALL CLEAR_64BIT_NUMERATOR
+    
+    ; ===== STEP 1: Convert Integer Part (6 digits) =====
+    ; Process digits R1_C12 through R1_C7 (positions 12,11,10,9,8,7)
+    BANKSEL PORTC
+    MOVLW D'6'
+    MOVWF DIGIT_COUNT
+    
+CONVERT_INTEGER_LOOP_64:
+    ; Multiply current NUMERATOR by 10
+    CALL MULTIPLY_64BIT_BY_10
+    
+    ; Add current digit to NUMERATOR
+    BANKSEL PORTC
+	MOVF FSR_TEMP2,0
+	MOVWF FSR
+    MOVF INDF, W           ; Get digit from memory
+    BANKSEL NUMERATOR
+    CALL ADD_8BIT_TO_64BIT
+    
+    ; Move to next digit (toward decimal point)
+    BANKSEL PORTC
+    DECF FSR_TEMP2, F            ; Move FSR to next lower address
+    BANKSEL NUMERATOR
+    
+    ; Continue for 6 integer digits
+    BANKSEL PORTC
+    DECFSZ DIGIT_COUNT, F
+    GOTO CONVERT_INTEGER_LOOP_64
+    
+    ; ===== STEP 2: Scale Integer Part by 1,000,000 =====
+    ; Now NUMERATOR contains integer part (e.g., 123456)
+    ; Multiply by 1,000,000 to make room for 6 fractional digits
+    CALL MULTIPLY_64BIT_BY_MILLION
+    
+    ; ===== STEP 3: Convert Fractional Part (6 digits) =====
+    ; Process digits R1_C6 through R1_C1 (positions 6,5,4,3,2,1)
+    ; FSR should now point to R1_C6 (first fractional digit)
+    
+    CALL COPY_NUMERATOR_TO_TEMP_INTEGER
+    
+    ; Clear NUMERATOR for fractional conversion
+    CALL CLEAR_64BIT_NUMERATOR
+    
+    ; Convert 6 fractional digits to integer
+    BANKSEL PORTC
+    MOVLW D'6'
+    MOVWF DIGIT_COUNT
+    
+CONVERT_FRACTIONAL_LOOP_64:
+    ; Multiply current NUMERATOR by 10
+    CALL MULTIPLY_64BIT_BY_10
+    
+    ; Add current digit to NUMERATOR
+    BANKSEL PORTC
+	MOVF FSR_TEMP2,0
+	MOVWF FSR
+    MOVF INDF, W           ; Get digit from memory
+    BANKSEL NUMERATOR
+    CALL ADD_8BIT_TO_64BIT 
+    
+    ; Move to next digit
+    BANKSEL PORTC
+    DECF FSR_TEMP2, F            ; Move FSR to next lower address
+    BANKSEL NUMERATOR
+    
+    ; Continue for 6 fractional digits
+    BANKSEL PORTC
+    DECFSZ DIGIT_COUNT, F
+    GOTO CONVERT_FRACTIONAL_LOOP_64
+    
+    ; ===== STEP 4: Combine Integer and Fractional Parts =====
+    ; Add fractional part to scaled integer part
+    CALL ADD_TEMP_INTEGER_TO_NUMERATOR
+    
+    RETURN
+
+
+
+
+; Clear 64-bit NUMERATOR
+CLEAR_64BIT_NUMERATOR:
+    BANKSEL NUMERATOR
+    MOVLW NUMERATOR
+    MOVWF FSR
+    MOVLW D'8'
+    MOVWF BYTE_COUNT
+CLEAR_NUM_LOOP:
+    CLRF INDF
+    INCF FSR, F
+    DECFSZ BYTE_COUNT, F
+    GOTO CLEAR_NUM_LOOP
+    RETURN
+
+
+; Multiply 64-bit NUMERATOR by 10
+; Method: 10 = 8 + 2, so multiply by 8 then add original×2
+MULTIPLY_64BIT_BY_10:
+    ; Save original value in TEMP_64
+	BANKSEL NUMERATOR
+    CALL COPY_NUMERATOR_TO_TEMP
+    
+    ; Multiply by 8 (shift left 3 times)
+    CALL SHIFT_LEFT_64BIT       ; NUMERATOR * 2
+    CALL SHIFT_LEFT_64BIT       ; NUMERATOR * 4  
+    CALL SHIFT_LEFT_64BIT       ; NUMERATOR * 8
+    
+    ; Add original value * 2 to get * 10
+    ; First shift TEMP_64 left once (original * 2)
+    CALL SHIFT_LEFT_64BIT_TEMP
+    
+    ; Add TEMP_64 to NUMERATOR to get (original * 10)
+    CALL ADD_64BIT_TEMP_TO_NUMERATOR
+    
+    RETURN
+
+; Shift NUMERATOR left by 1 bit (multiply by 2)
+SHIFT_LEFT_64BIT:
+    BANKSEL NUMERATOR
+    MOVLW NUMERATOR
+    MOVWF FSR
+    BCF STATUS, C               ; Clear carry
+    MOVLW D'8'
+    MOVWF BYTE_COUNT
+SHIFT_64_LOOP:
+    RLF INDF, F                 ; Rotate left through carry
+    INCF FSR, F
+    DECFSZ BYTE_COUNT, F
+    GOTO SHIFT_64_LOOP
+    RETURN
+
+; Shift TEMP_64 left by 1 bit
+SHIFT_LEFT_64BIT_TEMP:
+    BANKSEL TEMP_64
+    MOVLW TEMP_64
+    MOVWF FSR
+    BCF STATUS, C               ; Clear carry
+    MOVLW D'8'
+    MOVWF BYTE_COUNT
+SHIFT_TEMP_64_LOOP:
+    RLF INDF, F                 ; Rotate left through carry
+    INCF FSR, F
+    DECFSZ BYTE_COUNT, F
+    GOTO SHIFT_TEMP_64_LOOP
+    RETURN
+
+; Add 8-bit value (in W) to 64-bit NUMERATOR
+ADD_8BIT_TO_64BIT:
+    BANKSEL NUMERATOR
+    ADDWF NUMERATOR, F          ; Add to LSB
+    MOVLW NUMERATOR+1
+    MOVWF FSR
+    MOVLW D'7'                  ; Propagate carry through 7 more bytes
+    MOVWF BYTE_COUNT
+    
+ADD_8BIT_CARRY_LOOP:
+    BTFSS STATUS, C
+    RETURN                      ; No carry, done
+    INCF INDF, F               ; Increment next byte
+    BTFSC STATUS, Z            ; Check if it rolled over to 0
+    GOTO ADD_8BIT_CONTINUE
+    RETURN                     ; No further carry needed
+ADD_8BIT_CONTINUE:
+    INCF FSR, F
+    DECFSZ BYTE_COUNT, F
+    GOTO ADD_8BIT_CARRY_LOOP
+    RETURN
+
+; Multiply 64-bit NUMERATOR by 1,000,000 (0x0F4240)
+MULTIPLY_64BIT_BY_MILLION:
+    BANKSEL NUMERATOR
+    ; Load multiplier = 1,000,000 (0x000F4240)
+    MOVLW 0x40
+    MOVWF MULTIPLIER
+    MOVLW 0x42
+    MOVWF MULTIPLIER+1
+    MOVLW 0x0F
+    MOVWF MULTIPLIER+2
+    CLRF MULTIPLIER+3
+    
+    ; Clear result in TEMP_64
+    CALL CLEAR_64BIT_TEMP
+    
+    ; 64-bit x 32-bit multiplication using shift and add
+    MOVLW D'24'              ; Only need to check 24 bits of multiplier (0x0F4240)
+    MOVWF TEMP_BIT_COUNT
+    
+MULTIPLY_MILLION_LOOP_64:
+    BANKSEL NUMERATOR
+    ; Check if LSB of multiplier is set
+    BTFSC MULTIPLIER, 0
+    CALL ADD_NUMERATOR_TO_TEMP_64
+    
+    ; Shift NUMERATOR left (multiply by 2)
+    CALL SHIFT_LEFT_64BIT
+    
+    ; Shift multiplier right (divide by 2)
+    RRF MULTIPLIER+2, F
+    RRF MULTIPLIER+1, F
+    RRF MULTIPLIER, F
+    
+    DECFSZ TEMP_BIT_COUNT, F
+    GOTO MULTIPLY_MILLION_LOOP_64
+    
+    ; Copy result back to NUMERATOR
+    CALL COPY_TEMP_TO_NUMERATOR
+    RETURN
+
+; Clear 64-bit TEMP_64
+CLEAR_64BIT_TEMP:
+    BANKSEL TEMP_64
+    MOVLW TEMP_64
+    MOVWF FSR
+    MOVLW D'8'
+    MOVWF BYTE_COUNT
+CLEAR_TEMP_LOOP:
+    CLRF INDF
+    INCF FSR, F
+    DECFSZ BYTE_COUNT, F
+    GOTO CLEAR_TEMP_LOOP
+    RETURN
+
+; Add NUMERATOR to TEMP_64 (64-bit addition)
+ADD_NUMERATOR_TO_TEMP_64:
+    BANKSEL NUMERATOR
+    BCF STATUS, C               ; Clear carry
+    
+    ; Add byte 0 (LSB)
+    MOVF NUMERATOR+0, W
+    ADDWF TEMP_64+0, F
+    
+    ; Add byte 1 with carry propagation
+    MOVF NUMERATOR+1, W
+    BTFSC STATUS, C             ; If carry from previous addition
+    ADDLW 1                     ; Add carry to W
+    ADDWF TEMP_64+1, F
+    
+    ; Add byte 2 with carry propagation
+    MOVF NUMERATOR+2, W
+    BTFSC STATUS, C
+    ADDLW 1
+    ADDWF TEMP_64+2, F
+    
+    ; Add byte 3 with carry propagation
+    MOVF NUMERATOR+3, W
+    BTFSC STATUS, C
+    ADDLW 1
+    ADDWF TEMP_64+3, F
+    
+    ; Add byte 4 with carry propagation
+    MOVF NUMERATOR+4, W
+    BTFSC STATUS, C
+    ADDLW 1
+    ADDWF TEMP_64+4, F
+    
+    ; Add byte 5 with carry propagation
+    MOVF NUMERATOR+5, W
+    BTFSC STATUS, C
+    ADDLW 1
+    ADDWF TEMP_64+5, F
+    
+    ; Add byte 6 with carry propagation
+    MOVF NUMERATOR+6, W
+    BTFSC STATUS, C
+    ADDLW 1
+    ADDWF TEMP_64+6, F
+    
+    ; Add byte 7 (MSB) with carry propagation
+    MOVF NUMERATOR+7, W
+    BTFSC STATUS, C
+    ADDLW 1
+    ADDWF TEMP_64+7, F
+    
+    RETURN
+
+
+MULTIPLY_32x16:
+    CLRF RESULT
+    CLRF RESULT+1
+    CLRF RESULT+2
+    CLRF RESULT+3
+	BANKSEL PORTC
+    MOVLW D'16'
+    MOVWF DIGIT_COUNT
+MUL_LOOP:
+	BANKSEL NUMERATOR
+    ; Check multiplier bit
+    RRF MULTIPLIER+1,F
+    RRF MULTIPLIER,F
+    BNC MUL_NOADD
+    
+    ; Add NUMERATOR to RESULT (32-bit addition)
+    MOVF NUMERATOR,W
+    ADDWF RESULT,F
+    MOVF NUMERATOR+1,W
+    BTFSC STATUS,C
+    INCFSZ NUMERATOR+1,W
+    ADDWF RESULT+1,F
+    MOVF NUMERATOR+2,W
+    BTFSC STATUS,C
+    INCFSZ NUMERATOR+2,W
+    ADDWF RESULT+2,F
+    MOVF NUMERATOR+3,W
+    BTFSC STATUS,C
+    INCFSZ NUMERATOR+3,W
+    ADDWF RESULT+3,F
+MUL_NOADD:
+    ; 32-bit left shift with carry
+    RLF NUMERATOR,F
+    RLF NUMERATOR+1,F
+    RLF NUMERATOR+2,F
+    RLF NUMERATOR+3,F
+	BANKSEL PORTC
+    DECFSZ DIGIT_COUNT,F
+    GOTO MUL_LOOP
+    RETURN
+
+; Copy NUMERATOR to TEMP_64 (64-bit copy)
+COPY_NUMERATOR_TO_TEMP:
+    BANKSEL NUMERATOR
+    ; Copy byte by byte using direct addressing
+    MOVF NUMERATOR+0, W
+    MOVWF TEMP_64+0
+    MOVF NUMERATOR+1, W
+    MOVWF TEMP_64+1
+    MOVF NUMERATOR+2, W
+    MOVWF TEMP_64+2
+    MOVF NUMERATOR+3, W
+    MOVWF TEMP_64+3
+    MOVF NUMERATOR+4, W
+    MOVWF TEMP_64+4
+    MOVF NUMERATOR+5, W
+    MOVWF TEMP_64+5
+    MOVF NUMERATOR+6, W
+    MOVWF TEMP_64+6
+    MOVF NUMERATOR+7, W
+    MOVWF TEMP_64+7
+    RETURN
+
+
+; Copy NUMERATOR to TEMP_64 (64-bit copy)
+COPY_NUMERATOR_TO_TEMP2:
+    BANKSEL NUMERATOR
+    ; Copy byte by byte using direct addressing
+    MOVF NUMERATOR+0, W
+    MOVWF TEMP_DIVISOR+0
+    MOVF NUMERATOR+1, W
+    MOVWF TEMP_DIVISOR+1
+    MOVF NUMERATOR+2, W
+    MOVWF TEMP_DIVISOR+2
+    MOVF NUMERATOR+3, W
+    MOVWF TEMP_DIVISOR+3
+    MOVF NUMERATOR+4, W
+    MOVWF TEMP_DIVISOR+4
+    MOVF NUMERATOR+5, W
+    MOVWF TEMP_DIVISOR+5
+    MOVF NUMERATOR+6, W
+    MOVWF TEMP_DIVISOR+6
+    MOVF NUMERATOR+7, W
+    MOVWF TEMP_DIVISOR+7
+    RETURN
+
+
+; Copy NUMERATOR to DENOMINATOR (64-bit copy)
+COPY_NUMERATOR_TO_DENOMINATOR:
+    BANKSEL NUMERATOR
+    MOVF NUMERATOR+0, W
+    MOVWF DENOMINATOR+0
+    MOVF NUMERATOR+1, W
+    MOVWF DENOMINATOR+1
+    MOVF NUMERATOR+2, W
+    MOVWF DENOMINATOR+2
+    MOVF NUMERATOR+3, W
+    MOVWF DENOMINATOR+3
+    MOVF NUMERATOR+4, W
+    MOVWF DENOMINATOR+4
+    MOVF NUMERATOR+5, W
+    MOVWF DENOMINATOR+5
+    MOVF NUMERATOR+6, W
+    MOVWF DENOMINATOR+6
+    MOVF NUMERATOR+7, W
+    MOVWF DENOMINATOR+7
+    RETURN
+
+; Copy TEMP_64 to NUMERATOR (64-bit copy)
+COPY_TEMP_TO_NUMERATOR:
+    BANKSEL TEMP_64
+    MOVF TEMP_64+0, W
+    MOVWF NUMERATOR+0
+    MOVF TEMP_64+1, W
+    MOVWF NUMERATOR+1
+    MOVF TEMP_64+2, W
+    MOVWF NUMERATOR+2
+    MOVF TEMP_64+3, W
+    MOVWF NUMERATOR+3
+    MOVF TEMP_64+4, W
+    MOVWF NUMERATOR+4
+    MOVF TEMP_64+5, W
+    MOVWF NUMERATOR+5
+    MOVF TEMP_64+6, W
+    MOVWF NUMERATOR+6
+    MOVF TEMP_64+7, W
+    MOVWF NUMERATOR+7
+    RETURN
+
+COPY_TEMP2_TO_NUMERATOR:
+    BANKSEL TEMP_64
+    MOVF TEMP_DIVISOR+0, W
+    MOVWF NUMERATOR+0
+    MOVF TEMP_DIVISOR+1, W
+    MOVWF NUMERATOR+1
+    MOVF TEMP_DIVISOR+2, W
+    MOVWF NUMERATOR+2
+    MOVF TEMP_DIVISOR+3, W
+    MOVWF NUMERATOR+3
+    MOVF TEMP_DIVISOR+4, W
+    MOVWF NUMERATOR+4
+    MOVF TEMP_DIVISOR+5, W
+    MOVWF NUMERATOR+5
+    MOVF TEMP_DIVISOR+6, W
+    MOVWF NUMERATOR+6
+    MOVF TEMP_DIVISOR+7, W
+    MOVWF NUMERATOR+7
+    RETURN
+
+
+; Copy NUMERATOR to TEMP_INTEGER (64-bit to 32-bit, take lower 32 bits)
+COPY_NUMERATOR_TO_TEMP_INTEGER:
+    BANKSEL NUMERATOR
+    MOVF NUMERATOR, W
+    MOVWF TEMP_INTEGER
+    MOVF NUMERATOR+1, W
+    MOVWF TEMP_INTEGER+1
+    MOVF NUMERATOR+2, W
+    MOVWF TEMP_INTEGER+2
+    MOVF NUMERATOR+3, W
+    MOVWF TEMP_INTEGER+3
+	MOVF NUMERATOR+4, W
+    MOVWF TEMP_INTEGER+4
+    MOVF NUMERATOR+5, W
+    MOVWF TEMP_INTEGER+5
+    MOVF NUMERATOR+6, W
+    MOVWF TEMP_INTEGER+6
+	MOVF NUMERATOR+7, W
+    MOVWF TEMP_INTEGER+7
+    RETURN
+
+; Add TEMP_INTEGER to NUMERATOR (32-bit to 64-bit addition)
+ADD_TEMP_INTEGER_TO_NUMERATOR:
+    BANKSEL NUMERATOR
+    MOVF TEMP_INTEGER, W
+    ADDWF NUMERATOR, F
+    MOVF TEMP_INTEGER+1, W
+    BTFSC STATUS, C
+    INCFSZ TEMP_INTEGER+1, W
+    ADDWF NUMERATOR+1, F
+    MOVF TEMP_INTEGER+2, W
+    BTFSC STATUS, C
+    INCFSZ TEMP_INTEGER+2, W
+    ADDWF NUMERATOR+2, F
+    MOVF TEMP_INTEGER+3, W
+    BTFSC STATUS, C
+    INCFSZ TEMP_INTEGER+3, W
+    ADDWF NUMERATOR+3, F
+	 MOVF TEMP_INTEGER+4, W
+    BTFSC STATUS, C
+    INCFSZ TEMP_INTEGER+4, W
+    ADDWF NUMERATOR+4, F
+    MOVF TEMP_INTEGER+5, W
+    BTFSC STATUS, C
+    INCFSZ TEMP_INTEGER+5, W
+    ADDWF NUMERATOR+5, F
+    MOVF TEMP_INTEGER+6, W
+    BTFSC STATUS, C
+    INCFSZ TEMP_INTEGER+6, W
+    ADDWF NUMERATOR+6, F
+    MOVF TEMP_INTEGER+7, W
+    BTFSC STATUS, C
+    INCFSZ TEMP_INTEGER+7, W
+    ADDWF NUMERATOR+7, F
+    RETURN
+
+ADD_64BIT_TEMP_TO_NUMERATOR:
+    BANKSEL NUMERATOR
+    BCF STATUS, C               ; Clear carry
+    
+    ; Add byte 0 (LSB)
+    MOVF TEMP_64+0, W
+    ADDWF NUMERATOR+0, F
+    
+    ; Add byte 1 
+    MOVF TEMP_64+1, W
+    BTFSC STATUS, C             ; If carry from byte 0
+    ADDLW 1                     ; Add carry to W
+    ADDWF NUMERATOR+1, F
+    
+    ; Add byte 2
+    MOVF TEMP_64+2, W
+    BTFSC STATUS, C             ; If carry from byte 1
+    ADDLW 1                     ; Add carry to W
+    ADDWF NUMERATOR+2, F
+    
+    ; Add byte 3
+    MOVF TEMP_64+3, W
+    BTFSC STATUS, C
+    ADDLW 1
+    ADDWF NUMERATOR+3, F
+    
+    ; Add byte 4
+    MOVF TEMP_64+4, W
+    BTFSC STATUS, C
+    ADDLW 1
+    ADDWF NUMERATOR+4, F
+    
+    ; Add byte 5
+    MOVF TEMP_64+5, W
+    BTFSC STATUS, C
+    ADDLW 1
+    ADDWF NUMERATOR+5, F
+    
+    ; Add byte 6
+    MOVF TEMP_64+6, W
+    BTFSC STATUS, C
+    ADDLW 1
+    ADDWF NUMERATOR+6, F
+    
+    ; Add byte 7 (MSB)
+    MOVF TEMP_64+7, W
+    BTFSC STATUS, C
+    ADDLW 1
+    ADDWF NUMERATOR+7, F
+    
+    RETURN
+;############################################################################################
+;
+;                                       [ DIVIDE_64x64 ]
+;
+;       scale the numerator for the second time
+;
+;       1. Initialize: quotient = 0, remainder = 0
+;		2. For each bit position (MSB to LSB):
+;  		a. Shift dividend left into remainder
+;     	b. Trial subtract: Can remainder - divisor be done?
+;	    c. If YES: Actually subtract, quotient bit = 1
+;	    d. If NO: Don't subtract, quotient bit = 0  
+; 	    e. Shift quotient bit into result
+;
+;###########################################################################################
+
+FIXED_DIVIDE_64BIT:
+    ; Scale numerator: NUMERATOR *= SCALE_FACTOR
+    CALL MULTIPLY_64BIT_BY_MILLION  ; Direct call - no setup needed!
+    
+    ; Perform division: RESULT = NUMERATOR/DENOMINATOR
+    CALL DIVIDE_64x64
+    CALL sendResult
+    RETURN
+	
+
+; 64-bit × 32-bit multiplication  
+MULTIPLY_64x32:
+    CALL CLEAR_64BIT_TEMP       ; Clear result
+    BANKSEL PORTC
+    MOVLW D'32'
+    MOVWF DIGIT_COUNT
+
+MUL_64x32_LOOP:
+    BANKSEL NUMERATOR
+    ; Check multiplier bit
+    RRF MULTIPLIER+3, F
+    RRF MULTIPLIER+2, F
+    RRF MULTIPLIER+1, F
+    RRF MULTIPLIER, F
+    BNC MUL_64x32_NOADD
+    
+    ; Add NUMERATOR to TEMP_64 (64-bit addition)
+    CALL ADD_NUMERATOR_TO_TEMP_64
+    
+MUL_64x32_NOADD:
+    ; 64-bit left shift of NUMERATOR
+    CALL SHIFT_LEFT_64BIT
+    
+    BANKSEL PORTC
+    DECFSZ DIGIT_COUNT, F
+    GOTO MUL_64x32_LOOP
+    
+    ; Copy result back to NUMERATOR
+    CALL COPY_TEMP_TO_NUMERATOR
+    RETURN
+
+; 64-bit ÷ 64-bit division
+DIVIDE_64x64:
+    ; Check for division by zero
+    CALL CHECK_64BIT_ZERO_DENOMINATOR
+    BTFSC STATUS, Z
+    GOTO DIVIDE_ERROR
+    
+    ; Initialize RESULT and SCRATCH to 0
+    CALL CLEAR_64BIT_RESULT
+    CALL CLEAR_64BIT_SCRATCH
+    
+	BANKSEL PORTC
+    MOVLW D'64'         ; 64 iterations
+    MOVWF DIGIT_COUNT
+    
+DIV_64x64_LOOP:
+    ; 64-bit shift left through NUMERATOR and SCRATCH
+	BANKSEL NUMERATOR
+    CALL SHIFT_LEFT_64BIT_NUMERATOR_SCRATCH
+    
+    ; Trial subtraction (64-bit)
+    CALL TRIAL_SUBTRACT_64BIT
+    BTFSS STATUS, C
+    GOTO DIV_64x64_SKIP
+    
+    ; Full 64-bit subtraction
+    CALL FULL_SUBTRACT_64BIT
+    BSF STATUS, C
+    
+DIV_64x64_SKIP:
+    ; Shift result bit in
+    CALL SHIFT_LEFT_64BIT_RESULT
+	BCF STATUS, C
+	BANKSEL PORTC
+    DECFSZ DIGIT_COUNT, F
+    GOTO DIV_64x64_LOOP
+	BANKSEL NUMERATOR
+    
+    GOTO DECOMPOSE_RESULT_64BIT
+CHECK_64BIT_ZERO_DENOMINATOR:
+    BANKSEL DENOMINATOR
+    MOVLW DENOMINATOR
+    MOVWF FSR
+    MOVLW D'8'
+    MOVWF BYTE_COUNT
+    
+CHECK_ZERO_DENOM_LOOP:
+    MOVF INDF, W
+    BTFSS STATUS, Z
+    RETURN                     ; Non-zero found, clear Z flag
+    INCF FSR, F
+    DECFSZ BYTE_COUNT, F
+    GOTO CHECK_ZERO_DENOM_LOOP
+    
+    ; All bytes are zero, set Z flag
+    BSF STATUS, Z
+    RETURN
+
+CLEAR_64BIT_RESULT:
+    BANKSEL RESULT
+    MOVLW RESULT
+    MOVWF FSR
+    MOVLW D'8'
+    MOVWF BYTE_COUNT
+CLEAR_RESULT_LOOP:
+    CLRF INDF
+    INCF FSR, F
+    DECFSZ BYTE_COUNT, F
+    GOTO CLEAR_RESULT_LOOP
+    RETURN
+
+CLEAR_64BIT_SCRATCH:
+    BANKSEL SCRATCH
+    MOVLW SCRATCH
+    MOVWF FSR
+    MOVLW D'8'
+    MOVWF BYTE_COUNT
+CLEAR_SCRATCH_LOOP:
+    CLRF INDF
+    INCF FSR, F
+    DECFSZ BYTE_COUNT, F
+    GOTO CLEAR_SCRATCH_LOOP
+    RETURN
+
+SHIFT_LEFT_64BIT_NUMERATOR_SCRATCH:
+    ; Shift NUMERATOR left first
+    CALL SHIFT_LEFT_64BIT
+    
+    ; Then shift SCRATCH left with carry from NUMERATOR
+    BANKSEL SCRATCH
+    MOVLW SCRATCH
+    MOVWF FSR
+    MOVLW D'8'
+    MOVWF BYTE_COUNT
+SHIFT_SCRATCH_LOOP:
+    RLF INDF, F                 ; Rotate left through carry
+    INCF FSR, F
+    DECFSZ BYTE_COUNT, F
+    GOTO SHIFT_SCRATCH_LOOP
+    RETURN
+
+SHIFT_LEFT_64BIT_RESULT:
+    BANKSEL RESULT
+    MOVLW RESULT
+    MOVWF FSR
+    ;BCF STATUS, C               ; Carry contains the quotient bit
+    MOVLW D'8'
+    MOVWF BYTE_COUNT
+SHIFT_RESULT_LOOP:
+    RLF INDF, F                 ; Rotate left through carry
+    INCF FSR, F
+    DECFSZ BYTE_COUNT, F
+    GOTO SHIFT_RESULT_LOOP
+    RETURN
+
+; Compare SCRATCH with DENOMINATOR (64-bit comparison)
+; Returns C=1 if SCRATCH >= DENOMINATOR, C=0 if SCRATCH < DENOMINATOR
+TRIAL_SUBTRACT_64BIT:
+    BANKSEL SCRATCH
+    
+    ; Compare from MSB to LSB (most significant byte first)
+    ; If any byte differs, we have our answer
+    
+    ; Compare byte 7 (MSB)
+    MOVF DENOMINATOR+7, W       ; Get DENOMINATOR MSB
+    SUBWF SCRATCH+7, W          ; SCRATCH+7 - DENOMINATOR+7
+    BTFSS STATUS, Z             ; If not equal
+    RETURN                      ; C flag has the result (C=1 if SCRATCH+7 >= DENOMINATOR+7)
+    
+    ; Byte 7 equal, compare byte 6
+    MOVF DENOMINATOR+6, W
+    SUBWF SCRATCH+6, W
+    BTFSS STATUS, Z
+    RETURN                      ; C flag has the result
+    
+    ; Byte 6 equal, compare byte 5
+    MOVF DENOMINATOR+5, W
+    SUBWF SCRATCH+5, W
+    BTFSS STATUS, Z
+    RETURN                      ; C flag has the result
+    
+    ; Byte 5 equal, compare byte 4
+    MOVF DENOMINATOR+4, W
+    SUBWF SCRATCH+4, W
+    BTFSS STATUS, Z
+    RETURN                      ; C flag has the result
+    
+    ; Byte 4 equal, compare byte 3
+    MOVF DENOMINATOR+3, W
+    SUBWF SCRATCH+3, W
+    BTFSS STATUS, Z
+    RETURN                      ; C flag has the result
+    
+    ; Byte 3 equal, compare byte 2
+    MOVF DENOMINATOR+2, W
+    SUBWF SCRATCH+2, W
+    BTFSS STATUS, Z
+    RETURN                      ; C flag has the result
+    
+    ; Byte 2 equal, compare byte 1
+    MOVF DENOMINATOR+1, W
+    SUBWF SCRATCH+1, W
+    BTFSS STATUS, Z
+    RETURN                      ; C flag has the result
+    
+    ; Byte 1 equal, compare byte 0 (LSB)
+    MOVF DENOMINATOR+0, W
+    SUBWF SCRATCH+0, W
+    ; C flag has the final result
+    ; If C=1: SCRATCH+0 >= DENOMINATOR+0, so SCRATCH >= DENOMINATOR
+    ; If C=0: SCRATCH+0 < DENOMINATOR+0, so SCRATCH < DENOMINATOR
+    
+    RETURN
+
+    
+TRIAL_COMPARE_DONE:
+    RETURN                     ; Carry flag has comparison result
+
+FULL_SUBTRACT_64BIT:
+    BANKSEL SCRATCH
+    
+    ; Subtract byte 0 (LSB)  
+    MOVF DENOMINATOR+0, W
+    SUBWF SCRATCH+0, F
+    
+    ; Subtract byte 1 with borrow
+    MOVF DENOMINATOR+1, W
+    BTFSS STATUS, C             ; If borrow (C=0)
+    ADDLW 1                     ; Add borrow to W instead of modifying source
+    SUBWF SCRATCH+1, F
+    
+    ; Subtract byte 2 with borrow
+    MOVF DENOMINATOR+2, W
+    BTFSS STATUS, C
+    ADDLW 1
+    SUBWF SCRATCH+2, F
+    
+    ; Subtract byte 3 with borrow
+    MOVF DENOMINATOR+3, W
+    BTFSS STATUS, C
+    ADDLW 1
+    SUBWF SCRATCH+3, F
+    
+    ; Subtract byte 4 with borrow
+    MOVF DENOMINATOR+4, W
+    BTFSS STATUS, C
+    ADDLW 1
+    SUBWF SCRATCH+4, F
+    
+    ; Subtract byte 5 with borrow
+    MOVF DENOMINATOR+5, W
+    BTFSS STATUS, C
+    ADDLW 1
+    SUBWF SCRATCH+5, F
+    
+    ; Subtract byte 6 with borrow
+    MOVF DENOMINATOR+6, W
+    BTFSS STATUS, C
+    ADDLW 1
+    SUBWF SCRATCH+6, F
+    
+    ; Subtract byte 7 (MSB) with borrow
+    MOVF DENOMINATOR+7, W
+    BTFSS STATUS, C
+    ADDLW 1
+    SUBWF SCRATCH+7, F
+    
+    RETURN
+;######################################################################################################
+;
+;                                            [ DECOMPOSE_RESULT ]
+;
+;          
+;
+;#####################################################################################################
+
+DECOMPOSE_RESULT_64BIT:
+    BANKSEL RESULT
+    
+    ; Step 1: Divide RESULT by 1,000,000 to separate integer and fractional parts
+    CALL DIVIDE_RESULT_BY_MILLION_64BIT
+    
+    ; Step 2: Extract integer digits from TEMP_QUOTIENT
+    ; Store in D12 (hundred thousands) down to D7 (units)
+    CALL EXTRACT_INTEGER_DIGITS_64BIT
+    
+    ; Step 3: Extract fractional digits from TEMP_REMAINDER  
+    ; Store in D6 (tenths) down to D1 (millionths)
+    CALL EXTRACT_FRACTIONAL_DIGITS_64BIT
+    
+    RETURN
+
+; =============================================================================
+; STEP 1: DIVIDE 64-BIT RESULT BY 1,000,000
+; =============================================================================
+
+DIVIDE_RESULT_BY_MILLION_64BIT:
+    ; Load divisor = 1,000,000 (0x000F4240) into TEMP_DIVISOR
+    BANKSEL TEMP_DIVISOR
+    MOVLW 0x40
+    MOVWF TEMP_DIVISOR+0
+    MOVLW 0x42
+    MOVWF TEMP_DIVISOR+1
+    MOVLW 0x0F
+    MOVWF TEMP_DIVISOR+2
+    CLRF TEMP_DIVISOR+3
+    CLRF TEMP_DIVISOR+4
+    CLRF TEMP_DIVISOR+5
+    CLRF TEMP_DIVISOR+6
+    CLRF TEMP_DIVISOR+7
+    
+    ; Copy RESULT to working register
+    CALL COPY_RESULT_TO_WORKING_64BIT
+    
+    ; Initialize quotient and remainder
+    CALL CLEAR_TEMP_QUOTIENT_64BIT
+    CALL CLEAR_TEMP_REMAINDER_64BIT
+    
+    ; Perform 64-bit division: TEMP_64 ÷ TEMP_DIVISOR
+    MOVLW D'64'                 ; 64-bit division requires 64 iterations
+    MOVWF TEMP_BIT_COUNT
+    
+DIVIDE_MILLION_LOOP:
+    ; Shift working number left into remainder
+    CALL SHIFT_LEFT_64BIT_WORKING_REMAINDER
+    
+    ; Compare remainder with 1,000,000
+    CALL COMPARE_REMAINDER_WITH_MILLION_64BIT
+    BTFSS STATUS, C
+    GOTO DIVIDE_MILLION_SKIP
+    
+    ; Subtract 1,000,000 from remainder
+    CALL SUBTRACT_MILLION_FROM_REMAINDER_64BIT
+    BSF STATUS, C               ; Set quotient bit
+    
+DIVIDE_MILLION_SKIP:
+    ; Shift quotient bit into TEMP_QUOTIENT
+    CALL SHIFT_LEFT_TEMP_QUOTIENT_64BIT
+    
+    DECFSZ TEMP_BIT_COUNT, F
+    GOTO DIVIDE_MILLION_LOOP
+    
+    ; Now: TEMP_QUOTIENT = integer part, TEMP_REMAINDER = fractional part
+    RETURN
+
+; =============================================================================
+; STEP 2: EXTRACT INTEGER DIGITS (D12 down to D7)
+; =============================================================================
+
+EXTRACT_INTEGER_DIGITS_64BIT:
+    ; Copy TEMP_QUOTIENT to TEMP_64 for digit extraction
+    CALL COPY_TEMP_QUOTIENT_TO_WORKING_64BIT
+    
+    ; Initialize all integer digits to 0
+    BANKSEL PORTC
+    CLRF D7
+    CLRF D8
+    CLRF D9
+    CLRF D10
+    CLRF D11
+    CLRF D12
+    BANKSEL NUMERATOR
+    
+    ; Extract digits using repeated division by 10 (reverse of original algorithm)
+    ; Extract from least significant (D7) to most significant (D12)
+    
+    ; Extract D7 (units) - same as original DIVIDE_WORKING_64BIT_BY_10
+    CALL DIVIDE_64BIT_BY_10
+    BANKSEL PORTC
+    MOVF TEMP_DIGIT, W
+    MOVWF D7
+    BANKSEL NUMERATOR
+    
+    ; Extract D8 (tens)
+    CALL DIVIDE_64BIT_BY_10
+    BANKSEL PORTC
+    MOVF TEMP_DIGIT, W
+    MOVWF D8
+    BANKSEL NUMERATOR
+    
+    ; Extract D9 (hundreds)
+    CALL DIVIDE_64BIT_BY_10
+    BANKSEL PORTC
+    MOVF TEMP_DIGIT, W
+    MOVWF D9
+    BANKSEL NUMERATOR
+    
+    ; Extract D10 (thousands)
+    CALL DIVIDE_64BIT_BY_10
+    BANKSEL PORTC
+    MOVF TEMP_DIGIT, W
+    MOVWF D10
+    BANKSEL NUMERATOR
+    
+    ; Extract D11 (ten thousands)
+    CALL DIVIDE_64BIT_BY_10
+    BANKSEL PORTC
+    MOVF TEMP_DIGIT, W
+    MOVWF D11
+    BANKSEL NUMERATOR
+    
+    ; Extract D12 (hundred thousands)
+    CALL DIVIDE_64BIT_BY_10
+    BANKSEL PORTC
+    MOVF TEMP_DIGIT, W
+    MOVWF D12
+    BANKSEL NUMERATOR
+    
+    RETURN
+
+; =============================================================================
+; STEP 3: EXTRACT FRACTIONAL DIGITS (D6 down to D1)
+; =============================================================================
+
+EXTRACT_FRACTIONAL_DIGITS_64BIT:
+    ; Copy TEMP_REMAINDER to TEMP_64 for digit extraction
+    ; The remainder contains fractional digits as integer (e.g., 123456 for .123456)
+    CALL COPY_TEMP_REMAINDER_TO_WORKING_64BIT
+    
+    ; Initialize all fractional digits to 0
+    BANKSEL PORTC
+    CLRF D1
+    CLRF D2
+    CLRF D3
+    CLRF D4
+    CLRF D5
+    CLRF D6
+    BANKSEL NUMERATOR
+    
+    ; Extract digits using repeated division by 10 (same method as integer)
+    ; Extract from least significant (D1) to most significant (D6)
+    
+    ; Extract D1 (millionths) - rightmost fractional digit
+    CALL DIVIDE_64BIT_BY_10
+    BANKSEL PORTC
+    MOVF TEMP_DIGIT, W
+    MOVWF D1
+    BANKSEL NUMERATOR
+    
+    ; Extract D2 (hundred thousandths)
+    CALL DIVIDE_64BIT_BY_10
+    BANKSEL PORTC
+    MOVF TEMP_DIGIT, W
+    MOVWF D2
+    BANKSEL NUMERATOR
+    
+    ; Extract D3 (ten thousandths)
+    CALL DIVIDE_64BIT_BY_10
+    BANKSEL PORTC
+    MOVF TEMP_DIGIT, W
+    MOVWF D3
+    BANKSEL NUMERATOR
+    
+    ; Extract D4 (thousandths)
+    CALL DIVIDE_64BIT_BY_10
+    BANKSEL PORTC
+    MOVF TEMP_DIGIT, W
+    MOVWF D4
+    BANKSEL NUMERATOR
+    
+    ; Extract D5 (hundredths)
+    CALL DIVIDE_64BIT_BY_10
+    BANKSEL PORTC
+    MOVF TEMP_DIGIT, W
+    MOVWF D5
+    BANKSEL NUMERATOR
+    
+    ; Extract D6 (tenths) - leftmost fractional digit
+    CALL DIVIDE_64BIT_BY_10
+    BANKSEL PORTC
+    MOVF TEMP_DIGIT, W
+    MOVWF D6
+    BANKSEL NUMERATOR
+    
+    RETURN
+; =============================================================================
+; 64-BIT DIVISION BY 10 (REVERSE HORNER'S METHOD)
+; =============================================================================
+
+DIVIDE_64BIT_BY_10:
+    ; Divide TEMP_64 by 10 using long division
+    ; Quotient replaces TEMP_64, remainder in TEMP_DIGIT
+    
+    BANKSEL PORTC
+    CLRF TEMP_DIGIT             ; Clear remainder
+    BANKSEL TEMP_64
+    
+    ; Perform long division from MSB to LSB
+    ; Process each byte: remainder = (remainder * 256 + byte) mod 10
+    ;                   quotient_byte = (remainder * 256 + byte) / 10
+    
+    ; Process byte 7 (MSB)
+    BANKSEL PORTC
+    MOVF TEMP_DIGIT, W          ; Previous remainder (0 for first byte)
+    BANKSEL TEMP_64
+    MOVF TEMP_64+7, W           ; Current byte
+    BANKSEL PORTC
+    CALL DIVIDE_BYTE_BY_10      ; Divide (remainder*256 + byte) by 10
+    BANKSEL TEMP_64
+    MOVF TEMP_QUOTIENT_BYTE, W
+    MOVWF TEMP_64+7
+    
+    ; Process byte 6
+    BANKSEL TEMP_64
+    MOVF TEMP_64+6, W
+    BANKSEL PORTC
+    CALL DIVIDE_BYTE_BY_10
+    BANKSEL TEMP_64
+    MOVF TEMP_QUOTIENT_BYTE, W
+    MOVWF TEMP_64+6
+    
+    ; Process byte 5
+    BANKSEL TEMP_64
+    MOVF TEMP_64+5, W
+    BANKSEL PORTC
+    CALL DIVIDE_BYTE_BY_10
+    BANKSEL TEMP_64
+    MOVF TEMP_QUOTIENT_BYTE, W
+    MOVWF TEMP_64+5
+    
+    ; Process byte 4
+    BANKSEL TEMP_64
+    MOVF TEMP_64+4, W
+    BANKSEL PORTC
+    CALL DIVIDE_BYTE_BY_10
+    BANKSEL TEMP_64
+    MOVF TEMP_QUOTIENT_BYTE, W
+    MOVWF TEMP_64+4
+    
+    ; Process byte 3
+    BANKSEL TEMP_64
+    MOVF TEMP_64+3, W
+    BANKSEL PORTC
+    CALL DIVIDE_BYTE_BY_10
+    BANKSEL TEMP_64
+    MOVF TEMP_QUOTIENT_BYTE, W
+    MOVWF TEMP_64+3
+    
+    ; Process byte 2
+    BANKSEL TEMP_64
+    MOVF TEMP_64+2, W
+    BANKSEL PORTC
+    CALL DIVIDE_BYTE_BY_10
+    BANKSEL TEMP_64
+    MOVF TEMP_QUOTIENT_BYTE, W
+    MOVWF TEMP_64+2
+    
+    ; Process byte 1
+    BANKSEL TEMP_64
+    MOVF TEMP_64+1, W
+    BANKSEL PORTC
+    CALL DIVIDE_BYTE_BY_10
+    BANKSEL TEMP_64
+    MOVF TEMP_QUOTIENT_BYTE, W
+    MOVWF TEMP_64+1
+    
+    ; Process byte 0 (LSB)
+    BANKSEL TEMP_64
+    MOVF TEMP_64+0, W
+    BANKSEL PORTC
+    CALL DIVIDE_BYTE_BY_10
+    BANKSEL TEMP_64
+    MOVF TEMP_QUOTIENT_BYTE, W
+    MOVWF TEMP_64+0
+    
+    ; Final remainder in TEMP_DIGIT is our extracted decimal digit
+    RETURN
+
+; =============================================================================
+; HELPER: DIVIDE (REMAINDER*256 + BYTE) BY 10
+; =============================================================================
+
+DIVIDE_BYTE_BY_10:
+    ; Input: W = current byte, TEMP_DIGIT = previous remainder
+    ; Output: TEMP_QUOTIENT_BYTE = quotient, TEMP_DIGIT = new remainder
+    
+    BANKSEL PORTC
+    MOVWF TEMP_CURRENT_BYTE     ; Save current byte
+    
+    ; Calculate dividend = remainder * 256 + current_byte
+    ; This is a 16-bit number: TEMP_DIGIT * 256 + TEMP_CURRENT_BYTE
+    ; Maximum value: 9 * 256 + 255 = 2559, so fits in 16 bits
+    
+    ; Set up 16-bit dividend in TEMP_DIVIDEND_HIGH:TEMP_DIVIDEND_LOW
+    MOVF TEMP_DIGIT, W
+    MOVWF TEMP_DIVIDEND_HIGH    ; remainder becomes high byte
+    MOVF TEMP_CURRENT_BYTE, W
+    MOVWF TEMP_DIVIDEND_LOW     ; current byte becomes low byte
+    
+    ; Now divide 16-bit number by 10 using table lookup or repeated subtraction
+    CLRF TEMP_QUOTIENT_BYTE     ; Clear quotient
+    
+    ; Use repeated subtraction for simplicity (max 255 iterations)
+DIVIDE_BYTE_LOOP:
+    ; Check if dividend >= 10
+    MOVF TEMP_DIVIDEND_HIGH, F
+    BTFSS STATUS, Z
+    GOTO SUBTRACT_10_FROM_DIVIDEND  ; High byte non-zero, definitely >= 10
+    
+    ; High byte is zero, check low byte
+    MOVLW D'10'
+    SUBWF TEMP_DIVIDEND_LOW, W
+    BTFSS STATUS, C
+    GOTO DIVIDE_BYTE_DONE       ; Less than 10, done
+    
+SUBTRACT_10_FROM_DIVIDEND:
+    ; Subtract 10 from 16-bit dividend
+    MOVLW D'10'
+    SUBWF TEMP_DIVIDEND_LOW, F
+    BTFSS STATUS, C
+    DECF TEMP_DIVIDEND_HIGH, F  ; Handle borrow
+    
+    ; Increment quotient
+    INCF TEMP_QUOTIENT_BYTE, F
+    
+    GOTO DIVIDE_BYTE_LOOP
+    
+DIVIDE_BYTE_DONE:
+    ; Quotient is in TEMP_QUOTIENT_BYTE
+    ; Remainder is in TEMP_DIVIDEND_LOW
+    MOVF TEMP_DIVIDEND_LOW, W
+    MOVWF TEMP_DIGIT            ; Update remainder for next iteration
+    RETURN
+
+; =============================================================================
+; HELPER FUNCTIONS
+; =============================================================================
+
+COPY_RESULT_TO_WORKING_64BIT:
+    BANKSEL RESULT
+    MOVF RESULT+0, W
+    MOVWF TEMP_64+0
+    MOVF RESULT+1, W
+    MOVWF TEMP_64+1
+    MOVF RESULT+2, W
+    MOVWF TEMP_64+2
+    MOVF RESULT+3, W
+    MOVWF TEMP_64+3
+    MOVF RESULT+4, W
+    MOVWF TEMP_64+4
+    MOVF RESULT+5, W
+    MOVWF TEMP_64+5
+    MOVF RESULT+6, W
+    MOVWF TEMP_64+6
+    MOVF RESULT+7, W
+    MOVWF TEMP_64+7
+    RETURN
+
+COPY_TEMP_QUOTIENT_TO_WORKING_64BIT:
+    BANKSEL TEMP_QUOTIENT
+    MOVF TEMP_QUOTIENT+0, W
+    MOVWF TEMP_64+0
+    MOVF TEMP_QUOTIENT+1, W
+    MOVWF TEMP_64+1
+    MOVF TEMP_QUOTIENT+2, W
+    MOVWF TEMP_64+2
+    MOVF TEMP_QUOTIENT+3, W
+    MOVWF TEMP_64+3
+    MOVF TEMP_QUOTIENT+4, W
+    MOVWF TEMP_64+4
+    MOVF TEMP_QUOTIENT+5, W
+    MOVWF TEMP_64+5
+    MOVF TEMP_QUOTIENT+6, W
+    MOVWF TEMP_64+6
+    MOVF TEMP_QUOTIENT+7, W
+    MOVWF TEMP_64+7
+    RETURN
+
+COPY_TEMP_REMAINDER_TO_WORKING_64BIT:
+    BANKSEL TEMP_REMAINDER
+    MOVF TEMP_REMAINDER+0, W
+    MOVWF TEMP_64+0
+    MOVF TEMP_REMAINDER+1, W
+    MOVWF TEMP_64+1
+    MOVF TEMP_REMAINDER+2, W
+    MOVWF TEMP_64+2
+    MOVF TEMP_REMAINDER+3, W
+    MOVWF TEMP_64+3
+    MOVF TEMP_REMAINDER+4, W
+    MOVWF TEMP_64+4
+    MOVF TEMP_REMAINDER+5, W
+    MOVWF TEMP_64+5
+    MOVF TEMP_REMAINDER+6, W
+    MOVWF TEMP_64+6
+    MOVF TEMP_REMAINDER+7, W
+    MOVWF TEMP_64+7
+    RETURN
+
+CLEAR_TEMP_QUOTIENT_64BIT:
+    BANKSEL TEMP_QUOTIENT
+    CLRF TEMP_QUOTIENT+0
+    CLRF TEMP_QUOTIENT+1
+    CLRF TEMP_QUOTIENT+2
+    CLRF TEMP_QUOTIENT+3
+    CLRF TEMP_QUOTIENT+4
+    CLRF TEMP_QUOTIENT+5
+    CLRF TEMP_QUOTIENT+6
+    CLRF TEMP_QUOTIENT+7
+    RETURN
+
+CLEAR_TEMP_REMAINDER_64BIT:
+    BANKSEL TEMP_REMAINDER
+    CLRF TEMP_REMAINDER+0
+    CLRF TEMP_REMAINDER+1
+    CLRF TEMP_REMAINDER+2
+    CLRF TEMP_REMAINDER+3
+    CLRF TEMP_REMAINDER+4
+    CLRF TEMP_REMAINDER+5
+    CLRF TEMP_REMAINDER+6
+    CLRF TEMP_REMAINDER+7
+    RETURN
+
+SHIFT_LEFT_64BIT_WORKING_REMAINDER:
+    ; Shift TEMP_64 left first
+    CALL SHIFT_LEFT_TEMP_WORKING_64BIT
+    
+    ; Then shift TEMP_REMAINDER left with carry from TEMP_64
+    ;BCF STATUS, C               ; Clear carry (will be set by working shift)
+    RLF TEMP_REMAINDER+0, F
+    RLF TEMP_REMAINDER+1, F
+    RLF TEMP_REMAINDER+2, F
+    RLF TEMP_REMAINDER+3, F
+    RLF TEMP_REMAINDER+4, F
+    RLF TEMP_REMAINDER+5, F
+    RLF TEMP_REMAINDER+6, F
+    RLF TEMP_REMAINDER+7, F
+    RETURN
+
+SHIFT_LEFT_TEMP_WORKING_64BIT:
+    BANKSEL TEMP_64
+    BCF STATUS, C
+    RLF TEMP_64+0, F
+    RLF TEMP_64+1, F
+    RLF TEMP_64+2, F
+    RLF TEMP_64+3, F
+    RLF TEMP_64+4, F
+    RLF TEMP_64+5, F
+    RLF TEMP_64+6, F
+    RLF TEMP_64+7, F
+    RETURN
+
+SHIFT_LEFT_TEMP_QUOTIENT_64BIT:
+    BANKSEL TEMP_QUOTIENT
+    RLF TEMP_QUOTIENT+0, F     ; Carry flag contains quotient bit
+    RLF TEMP_QUOTIENT+1, F
+    RLF TEMP_QUOTIENT+2, F
+    RLF TEMP_QUOTIENT+3, F
+    RLF TEMP_QUOTIENT+4, F
+    RLF TEMP_QUOTIENT+5, F
+    RLF TEMP_QUOTIENT+6, F
+    RLF TEMP_QUOTIENT+7, F
+    RETURN
+
+COMPARE_REMAINDER_WITH_MILLION_64BIT:
+    ; Compare TEMP_REMAINDER with TEMP_DIVISOR (1,000,000)
+    ; Returns C=1 if TEMP_REMAINDER >= 1,000,000
+    
+    BANKSEL TEMP_REMAINDER
+    ; Since 1,000,000 fits in 24 bits, only need to check first 3 bytes
+    ; and ensure upper bytes of remainder are zero for valid comparison
+    
+    ; Check if any upper bytes are non-zero (would make remainder > 1,000,000)
+    MOVF TEMP_REMAINDER+7, W
+    IORWF TEMP_REMAINDER+6, W
+    IORWF TEMP_REMAINDER+5, W
+    IORWF TEMP_REMAINDER+4, W
+    IORWF TEMP_REMAINDER+3, W
+    BTFSS STATUS, Z
+    GOTO REMAINDER_GREATER_THAN_MILLION
+    
+    ; Compare lower 3 bytes with 1,000,000 (0x0F4240)
+    MOVF TEMP_DIVISOR+2, W   ; 0x0F
+    SUBWF TEMP_REMAINDER+2, W
+    BTFSS STATUS, Z
+    RETURN                      ; Not equal - carry has result
+    
+    MOVF TEMP_DIVISOR+1, W   ; 0x42
+    SUBWF TEMP_REMAINDER+1, W
+    BTFSS STATUS, Z
+    RETURN
+    
+    MOVF TEMP_DIVISOR+0, W   ; 0x40
+    SUBWF TEMP_REMAINDER+0, W
+    RETURN                      ; Carry has final result
+
+REMAINDER_GREATER_THAN_MILLION:
+    BSF STATUS, C               ; Set carry (remainder >= divisor)
+    RETURN
+
+SUBTRACT_MILLION_FROM_REMAINDER_64BIT:
+    ; Subtract TEMP_DIVISOR from TEMP_REMAINDER
+    BANKSEL TEMP_REMAINDER
+    
+    ; Subtract 1,000,000 (0x0F4240) from TEMP_REMAINDER
+    MOVF TEMP_DIVISOR+0, W   ; 0x40
+    SUBWF TEMP_REMAINDER+0, F
+    
+    MOVF TEMP_DIVISOR+1, W   ; 0x42
+    BTFSS STATUS, C
+    ADDLW 1                     ; Add borrow
+    SUBWF TEMP_REMAINDER+1, F
+    
+    MOVF TEMP_DIVISOR+2, W   ; 0x0F
+    BTFSS STATUS, C
+    ADDLW 1                     ; Add borrow
+    SUBWF TEMP_REMAINDER+2, F
+    
+    ; Handle borrow propagation through upper bytes if needed
+    BTFSS STATUS, C
+    GOTO PROPAGATE_BORROW_UPPER_BYTES
+    RETURN
+
+PROPAGATE_BORROW_UPPER_BYTES:
+    ; Propagate borrow through bytes 3-7
+    MOVF TEMP_REMAINDER+3, F
+    BTFSC STATUS, Z
+    GOTO BORROW_FROM_BYTE_4
+    DECF TEMP_REMAINDER+3, F
+    RETURN
+
+BORROW_FROM_BYTE_4:
+    DECF TEMP_REMAINDER+3, F  ; Set to 0xFF
+    MOVF TEMP_REMAINDER+4, F
+    BTFSC STATUS, Z
+    GOTO BORROW_FROM_BYTE_5
+    DECF TEMP_REMAINDER+4, F
+    RETURN
+
+BORROW_FROM_BYTE_5:
+    DECF TEMP_REMAINDER+4, F  ; Set to 0xFF
+    MOVF TEMP_REMAINDER+5, F
+    BTFSC STATUS, Z
+    GOTO BORROW_FROM_BYTE_6
+    DECF TEMP_REMAINDER+5, F
+    RETURN
+
+BORROW_FROM_BYTE_6:
+    DECF TEMP_REMAINDER+5, F  ; Set to 0xFF
+    MOVF TEMP_REMAINDER+6, F
+    BTFSC STATUS, Z
+    GOTO BORROW_FROM_BYTE_7
+    DECF TEMP_REMAINDER+6, F
+    RETURN
+
+BORROW_FROM_BYTE_7:
+    DECF TEMP_REMAINDER+6, F  ; Set to 0xFF
+    DECF TEMP_REMAINDER+7, F
+    RETURN
+
+
+
+
+
+
+
+
+
+
+DIVIDE_ERROR:
+    ; Handle division by zero error
+    ; Use existing error handling from original code
+    RETURN
+
+sendResult:
+	MOVLW   0x01
+    MOVWF   D1
+    MOVLW   0x02
+    MOVWF   D2
+    MOVLW   0x03
+    MOVWF   D3
+    MOVLW   0x04
+    MOVWF   D4
+    MOVLW   0x05
+    MOVWF   D5
+    MOVLW   0x06
+    MOVWF   D6
+    MOVLW   0x07
+    MOVWF   D7
+    MOVLW   0x08
+    MOVWF   D8
+    MOVLW   0x09
+    MOVWF   D9
+    MOVLW   0x00
+    MOVWF   D10
+    MOVLW   0x01
+    MOVWF   D11
+    MOVLW   0x02
+    MOVWF   D12
+    ;––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––;
+	; disable interrubts on RB4 pin
+	BANKSEL INTCON
+    BCF     INTCON, RBIF     ; clear any pending flag
+    BCF     INTCON, RBIE     ; disable RB-on-change
+;  Configure PORTC pins as outputs (data bus to master)
+
+    ;BANKSEL PORTC
+    ;CLRF PORTC
+
+	BANKSEL    TRISB
+    BCF        TRISB,4         ; RB4 as output ? drives line low
+	BSF 	   TRISB,2		   ; RB2 AS INPUT  	
+	;––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––;
+    
+	BANKSEL PORTC
+	MOVLW	   D'12'
+	MOVWF 	   DIGIT_COUNTER   ; CLEAR THE DIGIT COUNTER
+	MOVLW   D'100'
+    CALL    xms         ; delay for 10ms
+	
+    ;––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––;
+SEND_LOOP:
+	CALL GET_BYTE_ADDR
+	BANKSEL PORTC
+	MOVWF   FSR              ; FSR ? file-address
+    MOVF    INDF, W          ; W ? [FSR]
+    ;MOVWF      PORTC           ; put digit on the bus
+	;NOP
+	BANKSEL TRISC
+    ;MOVLW   b'00000000'
+    MOVWF   TRISC        ; all PC pins = outputs
+	NOP
+
+	MOVLW   D'100'
+    CALL    xms         ; delay for 10ms to make sure the data is sent
+
+    BANKSEL PORTD
+    BSF     PORTD, 1        ; Turn ON LED (don't toggle, just turn on)
+
+	MOVLW   D'100'
+    CALL    xms         ; delay for 10ms to make sure the data is sent
+
+    BANKSEL PORTB
+	MOVF  PORTB, W     ; W = PORTB
+    XORLW D'16'         ; toggle bit4 (0x10 mask)
+    MOVWF PORTB        ; write back, only bit4 flips
+    NOP
+
+
+    ; 4) Wait for master’s ACK on RB2
+    CALL       WAIT_ACK
+
+    ; Turn off LED after a short delay
+    MOVLW   D'50'
+    CALL    xms
+    BANKSEL PORTD
+    BCF     PORTD, 1        ; Turn OFF LED
+	
+
+	MOVLW   D'100'
+    CALL    xms         ; delay for 10ms to make sure the data is sent
+
+	DECFSZ	DIGIT_COUNTER
+	GOTO SEND_LOOP
+    RETURN
+
+;------------------------------------------------------------------------------;
+;  Subroutine:  WAIT_ACK
+;  Waits for RB2 low then high (master’s ACK pulse). Returns when done.
+;------------------------------------------------------------------------------;
+WAIT_ACK:
+    BANKSEL    PORTB
+ACK_LOW:
+    BTFSC      PORTB,2        ; skip next if RB2=0? No—BTFSC skips if bit is clear (0)
+    GOTO       ACK_LOW        ; so this loops while RB2 is HIGH (idle)
+    ; now RB2 has just gone LOW ? ACK
+
+ACK_HIGH:
+    BTFSS      PORTB,2        ; skip next if RB2=1
+    GOTO       ACK_HIGH       ; loop while RB2 is LOW (still holding ack)
+    ; now RB2 is released back HIGH
+    RETURN
+GET_BYTE_ADDR: ;///////////////////////////////let him send the result 
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'1'
+		BTFSC STATUS, Z
+        RETLW   D1           
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'2'
+		BTFSC STATUS, Z
+        RETLW   D2     
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'3'
+		BTFSC STATUS, Z
+        RETLW   D3
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'4'
+		BTFSC STATUS, Z
+        RETLW   D4
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'5'
+		BTFSC STATUS, Z
+        RETLW   D5
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'6'
+		BTFSC STATUS, Z
+        RETLW   D6            
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'7'
+		BTFSC STATUS, Z
+        RETLW   D7 
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'8'
+		BTFSC STATUS, Z
+        RETLW   D8 
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'9'
+		BTFSC STATUS, Z
+        RETLW   D9
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'10'
+		BTFSC STATUS, Z
+        RETLW   D10
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'11'
+		BTFSC STATUS, Z
+        RETLW   D11
+		MOVF DIGIT_COUNTER,0
+        SUBLW D'12'
+		BTFSC STATUS, Z
+        RETLW   D12 
+		MOVF DIGIT_COUNTER,0
+
+    RETURN
+LOOP:
+
+GOTO LOOP
+
+END
